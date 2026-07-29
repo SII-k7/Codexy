@@ -1,0 +1,56 @@
+{
+  "description": "Codexy hooks: sync privacy-minimized Codex lifecycle state and the latest ten sanitized user prompts.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Windows\\System32\\cmd.exe /d /s /c call \"%USERPROFILE%\\.codex\\codexy-hooks\\capture_prompt.cmd\"",
+            "commandWindows": "C:\\Windows\\System32\\cmd.exe /d /s /c call \"%USERPROFILE%\\.codex\\codexy-hooks\\capture_prompt.cmd\"",
+            "timeout": 5,
+            "statusMessage": "Updating your private CLI track"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Windows\\System32\\cmd.exe /d /s /c call \"%USERPROFILE%\\.codex\\codexy-hooks\\notify_mobile.cmd\"",
+            "commandWindows": "C:\\Windows\\System32\\cmd.exe /d /s /c call \"%USERPROFILE%\\.codex\\codexy-hooks\\notify_mobile.cmd\"",
+            "timeout": 5,
+            "statusMessage": "Notifying your paired phone"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Windows\\System32\\cmd.exe /d /s /c call \"%USERPROFILE%\\.codex\\codexy-hooks\\notify_mobile.cmd\"",
+            "commandWindows": "C:\\Windows\\System32\\cmd.exe /d /s /c call \"%USERPROFILE%\\.codex\\codexy-hooks\\notify_mobile.cmd\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Windows\\System32\\cmd.exe /d /s /c call \"%USERPROFILE%\\.codex\\codexy-hooks\\notify_mobile.cmd\"",
+            "commandWindows": "C:\\Windows\\System32\\cmd.exe /d /s /c call \"%USERPROFILE%\\.codex\\codexy-hooks\\notify_mobile.cmd\"",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

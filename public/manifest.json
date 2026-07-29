@@ -1,0 +1,31 @@
+{
+  "id": "/codexy",
+  "name": "Codexy",
+  "short_name": "Codexy",
+  "description": "面向 Codex CLI 的非官方手机伴侣：接收状态、发送 Prompt，并整理项目思路。",
+  "lang": "zh-CN",
+  "start_url": "/?source=codexy-pwa",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#F5F3EC",
+  "theme_color": "#111111",
+  "categories": [
+    "productivity",
+    "utilities"
+  ],
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

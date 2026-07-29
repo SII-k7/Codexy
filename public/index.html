@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta httpEquiv="X-UA-Compatible" content="IE=edge" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="application-name" content="Codexy" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Codexy" />
+    <meta
+      name="description"
+      content="面向 Codex CLI 的非官方手机伴侣：接收状态、发送 Prompt，并整理项目思路。"
+    />
+    <meta name="theme-color" content="#111111" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
+    <link rel="manifest" href="/manifest.json" />
+    <title>Codexy</title>
+    <style id="expo-reset">
+      html,
+      body {
+        height: 100%;
+      }
+
+      body {
+        margin: 0;
+        overflow: hidden;
+        overscroll-behavior: none;
+        background: #f5f3ec;
+      }
+
+      #root {
+        display: flex;
+        height: 100%;
+        flex: 1;
+      }
+    </style>
+    <script>
+      if (
+        'serviceWorker' in navigator &&
+        window.location.protocol === 'https:'
+      ) {
+        window.addEventListener('load', function () {
+          navigator.serviceWorker.register('/sw.js').catch(function () {
+            // The app remains usable online if service worker setup fails.
+          });
+        });
+      }
+    </script>
+  </head>
+  <body>
+    <noscript>Codexy 需要 JavaScript 才能运行。</noscript>
+    <div id="root"></div>
+  </body>
+</html>
