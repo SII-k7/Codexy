@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -36,6 +36,15 @@ if (!token) {
   process.exit(1);
 }
 
+const projectAlias =
+  process.env.CODEXY_PROJECT_ALIAS ??
+  process.env.ATTENTION_PROJECT_ALIAS ??
+  'Codexy demo';
+const sessionRef =
+  process.env.CODEXY_SESSION_REF ??
+  `sha256:${createHash('sha256')
+    .update(`codexy-demo:${projectAlias}`)
+    .digest('hex')}`;
 const eventId = randomUUID();
 const response = await fetch(relayUrl, {
   method: 'POST',
@@ -52,14 +61,12 @@ const response = await fetch(relayUrl, {
     source: 'codex',
     state,
     event: 'Manual',
-    project_alias:
-      process.env.CODEXY_PROJECT_ALIAS ??
-      process.env.ATTENTION_PROJECT_ALIAS ??
-      'Codexy demo',
+    project_alias: projectAlias,
+    session_ref: sessionRef,
     summary:
       state === 'needs_you'
-        ? 'Agent needs your confirmation to continue'
-        : 'Codex status changed',
+        ? '需要你确认：手机通知能否准确打开这条测试轨道？'
+        : 'Codexy 测试会话状态已更新',
   }),
 });
 

@@ -419,6 +419,42 @@ test('rejects non-Codex lifecycle and Prompt sources', async () => {
   assert.equal(prompt.status, 400);
 });
 
+test('initializes a new session from its first lifecycle event', async () => {
+  const { deviceSecret, hookToken } = await registerAndPair();
+  const sessionRef = 'sha256:333333333333333333333333';
+  const occurredAt = new Date(Date.now() - 1_000).toISOString();
+
+  const lifecycle = await json('/v1/events', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${hookToken}` },
+    body: JSON.stringify({
+      event_id: 'first-session-lifecycle',
+      dedupe_key: 'first-session-lifecycle',
+      occurred_at: occurredAt,
+      source: 'codex',
+      state: 'needs_you',
+      event: 'PermissionRequest',
+      project_alias: 'First event project',
+      summary: 'The first event needs a decision',
+      session_ref: sessionRef,
+    }),
+  });
+  assert.equal(lifecycle.status, 202);
+
+  const response = await json('/v1/devices/device-test-123/sessions', {
+    headers: { Authorization: `Bearer ${deviceSecret}` },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.sessions.length, 1);
+  assert.equal(response.body.sessions[0].session_ref, sessionRef);
+  assert.equal(response.body.sessions[0].state, 'needs_you');
+  assert.equal(
+    response.body.sessions[0].summary,
+    'The first event needs a decision',
+  );
+  assert.equal(response.body.sessions[0].updated_at, occurredAt);
+});
+
 test('tracks parallel sessions with ten privacy-filtered prompts each', async () => {
   const { deviceSecret, hookToken } = await registerAndPair();
   const firstSession = 'sha256:111111111111111111111111';

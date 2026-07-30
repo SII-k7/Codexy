@@ -359,7 +359,9 @@ function getOrCreateAgentSession(device, input) {
       project_alias: input.project_alias,
       state: 'working',
       summary: '已收到新的工作指令',
-      updated_at: new Date().toISOString(),
+      // The first lifecycle event is timestamped before it reaches the Relay.
+      // Start at the epoch so that event, rather than this placeholder, wins.
+      updated_at: new Date(0).toISOString(),
       last_event_at: null,
       acknowledged_at: null,
       prompts: [],
