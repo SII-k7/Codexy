@@ -31,6 +31,7 @@ yarn-debug.*
 yarn-error.*
 expo-*.out.log
 expo-*.err.log
+.tmp-app-server-schema-*/
 __pycache__/
 *.py[cod]
 

@@ -5,11 +5,69 @@ import { dirname, resolve } from 'node:path';
 import WebSocket from 'ws';
 
 import { RemoteCommandError } from './remote-commands.mjs';
+import { summarizeLatestAgentReply } from './response-summary.mjs';
 
 const DEFAULT_APP_SERVER_URL = 'ws://127.0.0.1:4510';
 const RPC_TIMEOUT_MS = 15_000;
 const INDEX_REFRESH_MS = 2_500;
 const QUEUE_POLL_MS = 1_000;
+const MODEL_CATALOG_TTL_MS = 60_000;
+
+function publicString(value, fallback = '', maxLength = 160) {
+  if (typeof value !== 'string') return fallback;
+  const cleaned = value
+    .normalize('NFKC')
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return (cleaned || fallback).slice(0, maxLength);
+}
+
+function publicIdentifier(value, fallback = '') {
+  const identifier = publicString(value, fallback, 80);
+  return /^[a-zA-Z0-9._:+-]{1,80}$/.test(identifier)
+    ? identifier
+    : fallback;
+}
+
+function publicRateLimitWindow(value) {
+  if (!value || typeof value !== 'object') return null;
+  const usedPercent = Number(value.usedPercent);
+  return {
+    used_percent: Number.isFinite(usedPercent)
+      ? Math.max(0, Math.min(100, usedPercent))
+      : 0,
+    window_minutes: Number.isFinite(Number(value.windowDurationMins))
+      ? Math.max(0, Number(value.windowDurationMins))
+      : null,
+    resets_at: Number.isFinite(Number(value.resetsAt))
+      ? new Date(Number(value.resetsAt) * 1000).toISOString()
+      : null,
+  };
+}
+
+function publicModel(model) {
+  const modelId = publicIdentifier(model?.model ?? model?.id);
+  if (!modelId) return null;
+  const efforts = [...new Set(
+    (Array.isArray(model?.supportedReasoningEfforts)
+      ? model.supportedReasoningEfforts
+      : []
+    )
+      .map((option) => publicIdentifier(option?.reasoningEffort))
+      .filter(Boolean),
+  )];
+  const defaultEffort = publicIdentifier(model?.defaultReasoningEffort);
+  return {
+    id: modelId,
+    display_name: publicString(model?.displayName, modelId, 64),
+    description: publicString(model?.description, '', 180),
+    is_default: model?.isDefault === true,
+    supported_efforts: efforts,
+    default_effort:
+      efforts.includes(defaultEffort) ? defaultEffort : efforts[0] ?? null,
+  };
+}
 
 function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -219,6 +277,8 @@ export class CodexControlBridge {
     this.rpc = null;
     this.child = null;
     this.threadIndex = new Map();
+    this.modelCatalog = [];
+    this.modelCatalogLoadedAt = 0;
     this.refreshTimer = null;
     this.startPromise = null;
     this.stopped = false;
@@ -239,8 +299,7 @@ export class CodexControlBridge {
     const thread = this.threadIndex.get(sessionRef);
     if (
       !thread ||
-      thread.status?.type === 'notLoaded' ||
-      thread.canAcceptDirectInput !== true
+      !['notLoaded', 'idle', 'active'].includes(thread.status?.type)
     ) {
       return 'observe_only';
     }
@@ -360,15 +419,7 @@ export class CodexControlBridge {
     this.threadIndex = nextIndex;
   }
 
-  async readThread(threadId, includeTurns = false) {
-    const result = await this.rpc.request('thread/read', {
-      threadId,
-      includeTurns,
-    });
-    return result.thread;
-  }
-
-  async dispatch(command, onStatus) {
+  async ensureReady() {
     if (!this.enabled) {
       throw new RemoteCommandError(
         'control_not_configured',
@@ -386,9 +437,12 @@ export class CodexControlBridge {
         503,
       );
     }
+  }
 
+  async threadForSession(sessionRef) {
+    await this.ensureReady();
     await this.refreshIndex();
-    let thread = this.threadIndex.get(command.sessionRef);
+    const thread = this.threadIndex.get(sessionRef);
     if (!thread) {
       throw new RemoteCommandError(
         'session_not_found',
@@ -396,9 +450,279 @@ export class CodexControlBridge {
       );
     }
     if (
-      thread.status?.type === 'notLoaded' ||
-      thread.canAcceptDirectInput !== true
+      !['notLoaded', 'idle', 'active'].includes(thread.status?.type)
     ) {
+      throw new RemoteCommandError(
+        'session_observe_only',
+        '这个会话目前只能观察；请用 codexy 恢复或重新打开后再操作。',
+      );
+    }
+    return thread;
+  }
+
+  async readThread(threadId, includeTurns = false) {
+    const result = await this.rpc.request('thread/read', {
+      threadId,
+      includeTurns,
+    });
+    return result.thread;
+  }
+
+  async resumeThread(thread) {
+    const result = await this.rpc.request('thread/resume', {
+      threadId: thread.id,
+      excludeTurns: true,
+    });
+    const resumed = result?.thread;
+    if (
+      !resumed ||
+      resumed.canAcceptDirectInput !== true ||
+      !['idle', 'active'].includes(resumed.status?.type)
+    ) {
+      throw new RemoteCommandError(
+        'session_observe_only',
+        '这个会话目前只能观察；请用 codexy 恢复或重新打开后再操作。',
+      );
+    }
+    this.threadIndex.set(sessionRefForThreadId(resumed.id), resumed);
+    return result;
+  }
+
+  async resumeForDirectInput(thread) {
+    if (thread.canAcceptDirectInput === true) return thread;
+    if (!['notLoaded', 'idle', 'active'].includes(thread.status?.type)) {
+      throw new RemoteCommandError(
+        'session_observe_only',
+        '这个会话目前只能观察；请用 codexy 恢复或重新打开后再发送。',
+      );
+    }
+    return (await this.resumeThread(thread)).thread;
+  }
+
+  async listModels(force = false) {
+    const cacheFresh =
+      this.modelCatalog.length > 0 &&
+      Date.now() - this.modelCatalogLoadedAt < MODEL_CATALOG_TTL_MS;
+    if (!force && cacheFresh) return this.modelCatalog;
+
+    const models = [];
+    let cursor = null;
+    do {
+      const result = await this.rpc.request('model/list', {
+        cursor,
+        limit: 100,
+        includeHidden: false,
+      });
+      for (const item of result?.data ?? []) {
+        if (item?.hidden === true) continue;
+        const model = publicModel(item);
+        if (model) models.push(model);
+      }
+      cursor = result?.nextCursor ?? null;
+    } while (cursor && models.length < 200);
+
+    this.modelCatalog = models;
+    this.modelCatalogLoadedAt = Date.now();
+    return models;
+  }
+
+  async readPublicRateLimit() {
+    try {
+      const result = await this.rpc.request('account/rateLimits/read');
+      const snapshot =
+        result?.rateLimitsByLimitId?.codex ?? result?.rateLimits ?? null;
+      if (!snapshot) return null;
+      return {
+        primary: publicRateLimitWindow(snapshot.primary),
+        secondary: publicRateLimitWindow(snapshot.secondary),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async buildControlSnapshot(sessionRef, resumed, models) {
+    const state = publicIdentifier(resumed?.thread?.status?.type, 'idle');
+    const currentModel = publicIdentifier(resumed?.model);
+    const currentEffort =
+      publicIdentifier(resumed?.reasoningEffort) ||
+      models.find((model) => model.id === currentModel)?.default_effort ||
+      null;
+    const permissionId = publicIdentifier(
+      resumed?.activePermissionProfile?.id,
+      'custom',
+    ).replace(/^:/, '');
+    const approvalPolicy =
+      typeof resumed?.approvalPolicy === 'string'
+        ? publicIdentifier(resumed.approvalPolicy, 'custom')
+        : 'custom';
+    return {
+      session_ref: sessionRef,
+      control_status: 'ready',
+      session_state: state,
+      model: currentModel,
+      reasoning_effort: currentEffort,
+      approval_policy: approvalPolicy,
+      permission_profile: permissionId,
+      settings_apply_to: 'subsequent_turns',
+      models,
+      rate_limit: await this.readPublicRateLimit(),
+      available_actions: {
+        status: true,
+        compact: state === 'idle',
+        review: state === 'idle',
+        interrupt: state === 'active',
+      },
+      refreshed_at: new Date().toISOString(),
+    };
+  }
+
+  async getSessionControl(sessionRef) {
+    const thread = await this.threadForSession(sessionRef);
+    const resumed = await this.resumeThread(thread);
+    const models = await this.listModels();
+    return this.buildControlSnapshot(sessionRef, resumed, models);
+  }
+
+  async getSessionResponseSummary(sessionRef) {
+    const thread = await this.threadForSession(sessionRef);
+    const storedThread = await this.readThread(thread.id, true);
+    return summarizeLatestAgentReply(sessionRef, storedThread);
+  }
+
+  async updateSessionSettings(sessionRef, input = {}) {
+    const current = await this.getSessionControl(sessionRef);
+    const modelId = publicIdentifier(input.model, current.model);
+    const model = current.models.find((candidate) => candidate.id === modelId);
+    if (!model) {
+      throw new RemoteCommandError(
+        'invalid_model',
+        '这个模型不在当前 Codex 账户的可用目录中。',
+        400,
+      );
+    }
+    const requestedEffort = publicIdentifier(
+      input.reasoningEffort,
+      current.reasoning_effort ?? model.default_effort,
+    );
+    const effort = model.supported_efforts.includes(requestedEffort)
+      ? requestedEffort
+      : model.default_effort;
+    if (!effort) {
+      throw new RemoteCommandError(
+        'invalid_reasoning_effort',
+        '这个模型没有可用的思考强度。',
+        400,
+      );
+    }
+
+    const thread = this.threadIndex.get(sessionRef);
+    if (!thread) {
+      throw new RemoteCommandError(
+        'session_not_found',
+        'App Server 中找不到这个会话。',
+      );
+    }
+    await this.rpc.request('thread/settings/update', {
+      threadId: thread.id,
+      model: model.id,
+      effort,
+    });
+    return this.getSessionControl(sessionRef);
+  }
+
+  async runSessionAction(sessionRef, action) {
+    if (action === 'status') {
+      return {
+        action,
+        accepted: true,
+        detail: '实时状态已刷新。',
+        snapshot: await this.getSessionControl(sessionRef),
+      };
+    }
+
+    const before = await this.getSessionControl(sessionRef);
+    const thread = this.threadIndex.get(sessionRef);
+    if (!thread) {
+      throw new RemoteCommandError(
+        'session_not_found',
+        'App Server 中找不到这个会话。',
+      );
+    }
+
+    let detail;
+    if (action === 'compact') {
+      if (before.session_state !== 'idle') {
+        throw new RemoteCommandError(
+          'session_busy',
+          '当前回合结束后才能压缩上下文。',
+        );
+      }
+      await this.rpc.request('thread/compact/start', {
+        threadId: thread.id,
+      });
+      detail = '已开始压缩上下文；完成后可继续下一轮。';
+    } else if (action === 'review') {
+      if (before.session_state !== 'idle') {
+        throw new RemoteCommandError(
+          'session_busy',
+          '当前回合结束后才能开始代码审查。',
+        );
+      }
+      await this.rpc.request('review/start', {
+        threadId: thread.id,
+        target: { type: 'uncommittedChanges' },
+        delivery: 'inline',
+      });
+      detail = '已开始审查未提交改动。';
+    } else if (action === 'interrupt') {
+      if (before.session_state !== 'active') {
+        throw new RemoteCommandError(
+          'no_active_turn',
+          '当前没有正在运行的回合。',
+        );
+      }
+      const activeThread = await this.readThread(thread.id, true);
+      const activeTurn = [...(activeThread?.turns ?? [])]
+        .reverse()
+        .find((turn) => turn.status === 'inProgress');
+      if (!activeTurn) {
+        throw new RemoteCommandError(
+          'no_active_turn',
+          '当前没有可停止的运行中回合。',
+        );
+      }
+      await this.rpc.request('turn/interrupt', {
+        threadId: thread.id,
+        turnId: activeTurn.id,
+      });
+      detail = '已请求停止当前回合。';
+    } else {
+      throw new RemoteCommandError(
+        'invalid_control_action',
+        '不支持这个 Codex 控制动作。',
+        400,
+      );
+    }
+
+    let snapshot = before;
+    try {
+      snapshot = await this.getSessionControl(sessionRef);
+    } catch {
+      // The accepted action remains truthful even if the immediate refresh races.
+    }
+    return {
+      action,
+      accepted: true,
+      detail,
+      snapshot,
+    };
+  }
+
+  async dispatch(command, onStatus) {
+    let thread = await this.threadForSession(command.sessionRef);
+    thread = await this.resumeForDirectInput(thread);
+    if (!['idle', 'active'].includes(thread.status?.type)) {
       throw new RemoteCommandError(
         'session_observe_only',
         '这个会话目前只能观察；请用 codexy 恢复或重新打开后再发送。',

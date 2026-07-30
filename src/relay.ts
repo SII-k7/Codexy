@@ -1,6 +1,10 @@
 import type {
   AgentEvent,
   AgentSession,
+  CodexControlAction,
+  CodexControlActionResult,
+  CodexControlSnapshot,
+  CodexReplySummary,
   DevicePreferences,
   DeviceRegistration,
   DeviceStatus,
@@ -157,6 +161,92 @@ export async function getRemotePromptCommands(
     },
   );
   return response.commands;
+}
+
+function sessionControlUrl(input: {
+  relayUrl: string;
+  deviceId: string;
+  sessionRef: string;
+}): string {
+  return `${normalizeRelayUrl(input.relayUrl)}/v1/devices/${encodeURIComponent(input.deviceId)}/sessions/${encodeURIComponent(input.sessionRef)}/control`;
+}
+
+export async function getSessionControl(input: {
+  relayUrl: string;
+  deviceId: string;
+  deviceSecret: string;
+  sessionRef: string;
+}): Promise<CodexControlSnapshot> {
+  const response = await requestJson<{
+    snapshot: CodexControlSnapshot;
+  }>(sessionControlUrl(input), {
+    headers: { Authorization: `Bearer ${input.deviceSecret}` },
+  });
+  return response.snapshot;
+}
+
+export async function getSessionReplySummary(input: {
+  relayUrl: string;
+  deviceId: string;
+  deviceSecret: string;
+  sessionRef: string;
+}): Promise<CodexReplySummary> {
+  const response = await requestJson<{
+    summary: CodexReplySummary;
+  }>(
+    `${normalizeRelayUrl(input.relayUrl)}/v1/devices/${encodeURIComponent(input.deviceId)}/sessions/${encodeURIComponent(input.sessionRef)}/reply-summary`,
+    {
+      headers: { Authorization: `Bearer ${input.deviceSecret}` },
+    },
+  );
+  return response.summary;
+}
+
+export async function updateSessionControl(input: {
+  relayUrl: string;
+  deviceId: string;
+  deviceSecret: string;
+  sessionRef: string;
+  model: string;
+  reasoningEffort: string;
+  idempotencyKey: string;
+}): Promise<CodexControlSnapshot> {
+  const response = await requestJson<{
+    snapshot: CodexControlSnapshot;
+  }>(sessionControlUrl(input), {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${input.deviceSecret}` },
+    body: JSON.stringify({
+      model: input.model,
+      reasoning_effort: input.reasoningEffort,
+      idempotency_key: input.idempotencyKey,
+    }),
+  });
+  return response.snapshot;
+}
+
+export async function runSessionControlAction(input: {
+  relayUrl: string;
+  deviceId: string;
+  deviceSecret: string;
+  sessionRef: string;
+  action: CodexControlAction;
+  idempotencyKey: string;
+}): Promise<CodexControlActionResult> {
+  const response = await requestJson<{
+    result: CodexControlActionResult;
+  }>(
+    `${normalizeRelayUrl(input.relayUrl)}/v1/devices/${encodeURIComponent(input.deviceId)}/sessions/${encodeURIComponent(input.sessionRef)}/actions`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${input.deviceSecret}` },
+      body: JSON.stringify({
+        action: input.action,
+        idempotency_key: input.idempotencyKey,
+      }),
+    },
+  );
+  return response.result;
 }
 
 export async function sendRemotePrompt(input: {

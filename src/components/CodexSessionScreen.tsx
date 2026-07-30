@@ -11,10 +11,16 @@ import {
 import type {
   AgentSession,
   AgentState,
+  CodexControlAction,
+  CodexControlActionResult,
+  CodexControlSnapshot,
+  CodexReplySummary,
   RemotePromptCommand,
   RemotePromptMode,
 } from '../types';
 import { buildLocalBrief } from '../intent';
+import { CodexControlDeck } from './CodexControlDeck';
+import { CodexReplySummaryCard } from './CodexReplySummaryCard';
 import { RemotePromptComposer } from './RemotePromptComposer';
 
 const STATE_LABELS: Record<AgentState, string> = {
@@ -51,10 +57,19 @@ export function CodexSessionScreen(props: {
   onAcknowledge: () => void;
   onCancelPrompt: (commandId: string) => Promise<RemotePromptCommand>;
   onClose: () => void;
+  onLoadControl: () => Promise<CodexControlSnapshot>;
+  onLoadReplySummary: () => Promise<CodexReplySummary>;
+  onRunControlAction: (
+    action: CodexControlAction,
+  ) => Promise<CodexControlActionResult>;
   onSendPrompt: (
     prompt: string,
     mode: RemotePromptMode,
   ) => Promise<RemotePromptCommand>;
+  onUpdateControl: (
+    model: string,
+    reasoningEffort: string,
+  ) => Promise<CodexControlSnapshot>;
 }) {
   const brief = buildLocalBrief(props.session);
   const needsYou = props.session.state === 'needs_you';
@@ -155,6 +170,27 @@ export function CodexSessionScreen(props: {
               )}
             </>
           ) : null}
+
+          <CodexReplySummaryCard
+            controlStatus={
+              props.session.control_status ?? 'setup_required'
+            }
+            online={props.online}
+            onLoad={props.onLoadReplySummary}
+            sessionRef={props.session.session_ref}
+            sessionUpdatedAt={props.session.updated_at}
+          />
+
+          <CodexControlDeck
+            controlStatus={
+              props.session.control_status ?? 'setup_required'
+            }
+            online={props.online}
+            onLoad={props.onLoadControl}
+            onRunAction={props.onRunControlAction}
+            onUpdate={props.onUpdateControl}
+            sessionRef={props.session.session_ref}
+          />
 
           <RemotePromptComposer
             latestCommand={props.latestCommand}

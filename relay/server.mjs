@@ -20,6 +20,7 @@ import {
   RemoteCommandError,
   createRemoteCommandManager,
 } from './remote-commands.mjs';
+import { sanitizeAgentReply } from './response-summary.mjs';
 
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_EVENTS_PER_DEVICE = 100;
@@ -29,6 +30,14 @@ const MAX_PROMPTS_PER_SESSION = 10;
 const PROMPT_RETENTION_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_PAIRING_TTL_MS = 10 * 60 * 1000;
 const MAX_REMOTE_PROMPT_LENGTH = 4_000;
+const MAX_CONTROL_REQUESTS = 100;
+const CONTROL_REQUEST_RETENTION_MS = 10 * 60 * 1000;
+const CONTROL_ACTIONS = new Set([
+  'status',
+  'compact',
+  'review',
+  'interrupt',
+]);
 const ALLOWED_STATES = new Set([
   'working',
   'needs_you',
@@ -416,6 +425,297 @@ function sessionControlStatus(session, codexControl) {
   return codexControl?.statusForSession?.(session.session_ref) ?? 'setup_required';
 }
 
+function validateSessionRef(value) {
+  const sessionRef = text(value, '', 80);
+  if (!/^sha256:[a-f0-9]{16,64}$/i.test(sessionRef)) {
+    throw new HttpError(400, 'session_ref is invalid', 'invalid_session_ref');
+  }
+  return sessionRef;
+}
+
+function requireControlSession(device, sessionRef, codexControl) {
+  const session = (device.agentSessions ?? []).find(
+    (candidate) => candidate.session_ref === sessionRef,
+  );
+  if (!session) {
+    throw new HttpError(404, 'session was not found', 'session_not_found');
+  }
+  const controlStatus = sessionControlStatus(session, codexControl);
+  if (controlStatus !== 'ready') {
+    const message =
+      controlStatus === 'unsupported'
+        ? '这个 Agent 来源暂不支持手机控制。'
+        : controlStatus === 'observe_only'
+          ? '这个会话目前只能观察；请在电脑端用 codexy 打开它。'
+          : '电脑端控制桥接尚未就绪。';
+    throw new HttpError(
+      controlStatus === 'checking' ? 503 : 409,
+      message,
+      `control_${controlStatus}`,
+    );
+  }
+  return session;
+}
+
+function normalizeControlIdempotencyKey(value) {
+  const key = text(value, '', 128);
+  if (!/^[a-zA-Z0-9._:-]{8,128}$/.test(key)) {
+    throw new HttpError(
+      400,
+      'idempotency_key is invalid',
+      'invalid_idempotency_key',
+    );
+  }
+  return key;
+}
+
+function normalizeControlSettings(body) {
+  const model =
+    typeof body.model === 'string'
+      ? text(body.model, '', 80)
+      : null;
+  const reasoningEffort =
+    typeof body.reasoning_effort === 'string'
+      ? text(body.reasoning_effort, '', 32)
+      : null;
+  if (!model && !reasoningEffort) {
+    throw new HttpError(
+      400,
+      'model or reasoning_effort is required',
+      'empty_control_settings',
+    );
+  }
+  return {
+    model,
+    reasoningEffort,
+    idempotencyKey: normalizeControlIdempotencyKey(
+      body.idempotency_key,
+    ),
+  };
+}
+
+function normalizeControlAction(body) {
+  const action = text(body.action, '', 24);
+  if (!CONTROL_ACTIONS.has(action)) {
+    throw new HttpError(
+      400,
+      'control action is invalid',
+      'invalid_control_action',
+    );
+  }
+  return {
+    action,
+    idempotencyKey: normalizeControlIdempotencyKey(
+      body.idempotency_key,
+    ),
+  };
+}
+
+function publicControlRateWindow(value) {
+  if (!value || typeof value !== 'object') return null;
+  const usedPercent = Number(value.used_percent);
+  const windowMinutes = Number(value.window_minutes);
+  const resetsAt = text(value.resets_at, '', 64);
+  return {
+    used_percent: Number.isFinite(usedPercent)
+      ? Math.max(0, Math.min(100, usedPercent))
+      : 0,
+    window_minutes:
+      Number.isFinite(windowMinutes) && windowMinutes >= 0
+        ? windowMinutes
+        : null,
+    resets_at:
+      resetsAt && Number.isFinite(Date.parse(resetsAt))
+        ? resetsAt
+        : null,
+  };
+}
+
+function publicControlSnapshot(value, sessionRef) {
+  const snapshot =
+    value && typeof value === 'object' ? value : {};
+  const models = (Array.isArray(snapshot.models) ? snapshot.models : [])
+    .map((item) => {
+      const id = text(item?.id, '', 80);
+      if (!/^[a-zA-Z0-9._:+-]{1,80}$/.test(id)) return null;
+      const supportedEfforts = [
+        ...new Set(
+          (
+            Array.isArray(item.supported_efforts)
+              ? item.supported_efforts
+              : []
+          )
+            .map((effort) => text(effort, '', 32))
+            .filter((effort) =>
+              /^[a-zA-Z0-9._:+-]{1,32}$/.test(effort),
+            ),
+        ),
+      ];
+      const defaultEffort = text(item.default_effort, '', 32);
+      return {
+        id,
+        display_name: text(item.display_name, id, 64),
+        description: text(item.description, '', 180),
+        is_default: item.is_default === true,
+        supported_efforts: supportedEfforts,
+        default_effort: supportedEfforts.includes(defaultEffort)
+          ? defaultEffort
+          : supportedEfforts[0] ?? null,
+      };
+    })
+    .filter(Boolean);
+  const identifier = (candidate, fallback = null, max = 80) => {
+    const cleaned = text(candidate, '', max);
+    return /^[a-zA-Z0-9._:+-]+$/.test(cleaned)
+      ? cleaned
+      : fallback;
+  };
+  const actions =
+    snapshot.available_actions &&
+    typeof snapshot.available_actions === 'object'
+      ? snapshot.available_actions
+      : {};
+  const rateLimit =
+    snapshot.rate_limit && typeof snapshot.rate_limit === 'object'
+      ? {
+          primary: publicControlRateWindow(snapshot.rate_limit.primary),
+          secondary: publicControlRateWindow(snapshot.rate_limit.secondary),
+        }
+      : null;
+  const refreshedAt = text(snapshot.refreshed_at, '', 64);
+  return {
+    session_ref: sessionRef,
+    control_status: 'ready',
+    session_state: identifier(snapshot.session_state, 'idle', 24),
+    model: identifier(snapshot.model),
+    reasoning_effort: identifier(
+      snapshot.reasoning_effort,
+      null,
+      32,
+    ),
+    approval_policy: identifier(
+      snapshot.approval_policy,
+      'custom',
+      32,
+    ),
+    permission_profile: identifier(
+      snapshot.permission_profile,
+      'custom',
+      32,
+    ),
+    settings_apply_to: 'subsequent_turns',
+    models,
+    rate_limit: rateLimit,
+    available_actions: {
+      status: actions.status === true,
+      compact: actions.compact === true,
+      review: actions.review === true,
+      interrupt: actions.interrupt === true,
+    },
+    refreshed_at:
+      refreshedAt && Number.isFinite(Date.parse(refreshedAt))
+        ? refreshedAt
+        : new Date().toISOString(),
+  };
+}
+
+function publicControlActionResult(value, sessionRef) {
+  const action = text(value?.action, '', 24);
+  return {
+    action: CONTROL_ACTIONS.has(action) ? action : 'status',
+    accepted: value?.accepted === true,
+    detail: text(value?.detail, 'Control action accepted.', 160),
+    snapshot: publicControlSnapshot(value?.snapshot, sessionRef),
+  };
+}
+
+function publicReplySummary(value, sessionRef) {
+  const summary =
+    value && typeof value === 'object' ? value : {};
+  const kinds = new Set([
+    'outcome',
+    'verification',
+    'attention',
+    'next',
+    'detail',
+  ]);
+  const labels = {
+    outcome: '完成',
+    verification: '验证',
+    attention: '注意',
+    next: '下一步',
+    detail: '要点',
+  };
+  const safeSummaryText = (candidate, maximum) =>
+    text(sanitizeAgentReply(candidate), '', maximum);
+  const headline = safeSummaryText(summary.headline, 112);
+  const available = summary.available === true && Boolean(headline);
+  const highlights = available
+    ? (Array.isArray(summary.highlights) ? summary.highlights : [])
+        .map((item) => {
+          const kind = text(item?.kind, 'detail', 24);
+          const safeKind = kinds.has(kind) ? kind : 'detail';
+          const highlightText = safeSummaryText(item?.text, 190);
+          if (!highlightText) return null;
+          return {
+            kind: safeKind,
+            label: labels[safeKind],
+            text: highlightText,
+          };
+        })
+        .filter(Boolean)
+        .slice(0, 4)
+    : [];
+  const timestamp = (candidate) => {
+    const cleaned = text(candidate, '', 64);
+    return cleaned && Number.isFinite(Date.parse(cleaned))
+      ? cleaned
+      : null;
+  };
+  const sourceCharacters = Number(summary.source_characters);
+  return {
+    available,
+    session_ref: sessionRef,
+    current_turn_active: summary.current_turn_active === true,
+    reason: available
+      ? null
+      : publicStringIdentifier(
+          summary.reason,
+          'no_final_reply',
+          48,
+        ),
+    turn_status: available
+      ? publicStringIdentifier(
+          summary.turn_status,
+          'completed',
+          24,
+        )
+      : null,
+    completed_at: available
+      ? timestamp(summary.completed_at)
+      : null,
+    headline: available ? headline : null,
+    highlights,
+    summary_method: 'local_extract',
+    source_characters:
+      Number.isFinite(sourceCharacters) && sourceCharacters >= 0
+        ? Math.min(Math.round(sourceCharacters), 1_000_000)
+        : 0,
+    source_truncated: summary.source_truncated === true,
+    raw_response_exposed: false,
+    persisted: false,
+    generated_at:
+      timestamp(summary.generated_at) ?? new Date().toISOString(),
+  };
+}
+
+function publicStringIdentifier(value, fallback, maximum) {
+  const identifier = text(value, '', maximum);
+  return /^[a-zA-Z0-9._:+-]+$/.test(identifier)
+    ? identifier
+    : fallback;
+}
+
 function publicAgentSessions(device, codexControl) {
   return [...(device.agentSessions ?? [])]
     .sort((left, right) => timestamp(right.updated_at) - timestamp(left.updated_at))
@@ -464,6 +764,43 @@ export function createRelayServer(options = {}) {
       codexControl.dispatch(command, setStatus),
     ...(options.remoteCommandOptions ?? {}),
   });
+  const controlRequests = new Map();
+
+  function pruneControlRequests() {
+    const cutoff = Date.now() - CONTROL_REQUEST_RETENTION_MS;
+    for (const [key, entry] of controlRequests) {
+      if (entry.createdAt < cutoff) controlRequests.delete(key);
+    }
+    while (controlRequests.size > MAX_CONTROL_REQUESTS) {
+      const oldest = controlRequests.keys().next().value;
+      if (!oldest) break;
+      controlRequests.delete(oldest);
+    }
+  }
+
+  function runIdempotentControlRequest(
+    deviceId,
+    idempotencyKey,
+    execute,
+  ) {
+    pruneControlRequests();
+    const key = `${deviceId}:${idempotencyKey}`;
+    const existing = controlRequests.get(key);
+    if (existing) return existing.promise;
+    const promise = Promise.resolve()
+      .then(execute)
+      .catch((error) => {
+        if (controlRequests.get(key)?.promise === promise) {
+          controlRequests.delete(key);
+        }
+        throw error;
+      });
+    controlRequests.set(key, {
+      createdAt: Date.now(),
+      promise,
+    });
+    return promise;
+  }
   void codexControl.start?.().catch((error) => {
     console.error(
       `Codex control bridge unavailable: ${
@@ -717,6 +1054,105 @@ export function createRelayServer(options = {}) {
             sessions: publicAgentSessions(device, codexControl),
             retention_hours: PROMPT_RETENTION_MS / (60 * 60 * 1000),
           });
+          return;
+        }
+
+        if (
+          request.method === 'GET' &&
+          segments[3] === 'sessions' &&
+          segments[4] &&
+          segments[5] === 'reply-summary' &&
+          segments.length === 6
+        ) {
+          const sessionRef = validateSessionRef(segments[4]);
+          requireControlSession(device, sessionRef, codexControl);
+          const summary = await codexControl.getSessionResponseSummary(
+            sessionRef,
+          );
+          sendJson(response, 200, {
+            summary: publicReplySummary(summary, sessionRef),
+            raw_response_exposed: false,
+            persisted: false,
+          });
+          return;
+        }
+
+        if (
+          request.method === 'GET' &&
+          segments[3] === 'sessions' &&
+          segments[4] &&
+          segments[5] === 'control' &&
+          segments.length === 6
+        ) {
+          const sessionRef = validateSessionRef(segments[4]);
+          requireControlSession(device, sessionRef, codexControl);
+          const snapshot = await codexControl.getSessionControl(
+            sessionRef,
+          );
+          sendJson(response, 200, {
+            snapshot: publicControlSnapshot(snapshot, sessionRef),
+            raw_thread_id_exposed: false,
+            working_directory_exposed: false,
+          });
+          return;
+        }
+
+        if (
+          request.method === 'PATCH' &&
+          segments[3] === 'sessions' &&
+          segments[4] &&
+          segments[5] === 'control' &&
+          segments.length === 6
+        ) {
+          const sessionRef = validateSessionRef(segments[4]);
+          requireControlSession(device, sessionRef, codexControl);
+          const input = normalizeControlSettings(await readJson(request));
+          const snapshot = await runIdempotentControlRequest(
+            device.deviceId,
+            `settings:${sessionRef}:${input.idempotencyKey}`,
+            () =>
+              codexControl.updateSessionSettings(sessionRef, {
+                model: input.model,
+                reasoningEffort: input.reasoningEffort,
+              }),
+          );
+          sendJson(response, 200, {
+            applied: true,
+            applies_to: 'subsequent_turns',
+            snapshot: publicControlSnapshot(snapshot, sessionRef),
+          });
+          return;
+        }
+
+        if (
+          request.method === 'POST' &&
+          segments[3] === 'sessions' &&
+          segments[4] &&
+          segments[5] === 'actions' &&
+          segments.length === 6
+        ) {
+          const sessionRef = validateSessionRef(segments[4]);
+          requireControlSession(device, sessionRef, codexControl);
+          const input = normalizeControlAction(await readJson(request));
+          const result = await runIdempotentControlRequest(
+            device.deviceId,
+            `action:${sessionRef}:${input.idempotencyKey}`,
+            () =>
+              codexControl.runSessionAction(
+                sessionRef,
+                input.action,
+              ),
+          );
+          sendJson(
+            response,
+            input.action === 'status' ? 200 : 202,
+            {
+              result: publicControlActionResult(
+                result,
+                sessionRef,
+              ),
+            },
+          );
           return;
         }
 

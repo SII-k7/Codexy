@@ -30,10 +30,14 @@ import {
   getDeviceStatus,
   getEvents,
   getRemotePromptCommands,
+  getSessionControl,
+  getSessionReplySummary,
   normalizeRelayUrl,
   registerDevice,
+  runSessionControlAction,
   sendRemotePrompt,
   updateDevicePreferences,
+  updateSessionControl,
 } from './src/relay';
 import {
   clearSavedDevice,
@@ -49,6 +53,10 @@ import type { WebPushStatus } from './src/webPushTypes';
 import type {
   AgentEvent,
   AgentSession,
+  CodexControlAction,
+  CodexControlActionResult,
+  CodexControlSnapshot,
+  CodexReplySummary,
   DevicePreferences,
   NotificationLevel,
   NotificationTone,
@@ -163,6 +171,140 @@ function createCommandKey(): string {
   return `codexy-mobile-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
+function createControlKey(action: string): string {
+  return `codexy-control-${action}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function previewControlSnapshot(
+  session: AgentSession,
+): CodexControlSnapshot {
+  const active = session.state === 'working';
+  return {
+    session_ref: session.session_ref,
+    control_status: 'ready',
+    session_state: active ? 'active' : 'idle',
+    model: 'gpt-5.6-sol',
+    reasoning_effort: 'medium',
+    approval_policy: 'on-request',
+    permission_profile: 'workspace-write',
+    settings_apply_to: 'subsequent_turns',
+    models: [
+      {
+        id: 'gpt-5.6-sol',
+        display_name: 'GPT-5.6 Sol',
+        description: '前沿 Agent 编码模型，适合复杂工程推进。',
+        is_default: true,
+        supported_efforts: [
+          'low',
+          'medium',
+          'high',
+          'xhigh',
+          'max',
+          'ultra',
+        ],
+        default_effort: 'medium',
+      },
+      {
+        id: 'gpt-5.6-terra',
+        display_name: 'GPT-5.6 Terra',
+        description: '平衡速度与深度的日常编码模型。',
+        is_default: false,
+        supported_efforts: [
+          'low',
+          'medium',
+          'high',
+          'xhigh',
+          'max',
+          'ultra',
+        ],
+        default_effort: 'medium',
+      },
+      {
+        id: 'gpt-5.6-luna',
+        display_name: 'GPT-5.6 Luna',
+        description: '轻量而灵活，适合快速迭代与检查。',
+        is_default: false,
+        supported_efforts: [
+          'low',
+          'medium',
+          'high',
+          'xhigh',
+          'max',
+        ],
+        default_effort: 'medium',
+      },
+    ],
+    rate_limit: {
+      primary: {
+        used_percent: 23,
+        window_minutes: 300,
+        resets_at: new Date(Date.now() + 97 * 60 * 1000).toISOString(),
+      },
+      secondary: null,
+    },
+    available_actions: {
+      status: true,
+      compact: !active,
+      review: !active,
+      interrupt: active,
+    },
+    refreshed_at: new Date().toISOString(),
+  };
+}
+
+function previewReplySummary(
+  session: AgentSession,
+): CodexReplySummary {
+  const researchSession = session.project_alias === 'research-agent';
+  return {
+    available: true,
+    session_ref: session.session_ref,
+    current_turn_active: session.state === 'working',
+    reason: null,
+    turn_status: 'completed',
+    completed_at: new Date(Date.now() - 7 * 60 * 1000).toISOString(),
+    headline: researchSession
+      ? '已完成上一轮失败样本分组，规划错误是目前最明显的问题。'
+      : '已完成移动端界面调整，并通过构建与基础交互检查。',
+    highlights: researchSession
+      ? [
+          {
+            kind: 'outcome',
+            label: '完成',
+            text: '样本已按感知、规划和工具调用三类整理。',
+          },
+          {
+            kind: 'verification',
+            label: '验证',
+            text: '所有结论都保留了对应样本，便于回到原始结果核对。',
+          },
+          {
+            kind: 'next',
+            label: '下一步',
+            text: '建议先针对规划错误做一轮最小消融实验。',
+          },
+        ]
+      : [
+          {
+            kind: 'verification',
+            label: '验证',
+            text: '类型检查和 Relay 自动化测试均已通过。',
+          },
+          {
+            kind: 'attention',
+            label: '注意',
+            text: '仍需在真实 iPhone 上确认通知深链和触控手感。',
+          },
+        ],
+    summary_method: 'local_extract',
+    source_characters: researchSession ? 682 : 438,
+    source_truncated: false,
+    raw_response_exposed: false,
+    persisted: false,
+    generated_at: new Date().toISOString(),
+  };
+}
+
 function formatClock(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
@@ -264,6 +406,9 @@ export default function App() {
   );
   const [cursor, setCursor] = useState(0);
   const cursorRef = useRef(0);
+  const previewControlsRef = useRef(
+    new Map<string, CodexControlSnapshot>(),
+  );
   const [refreshing, setRefreshing] = useState(false);
   const [webPushStatus, setWebPushStatus] = useState<WebPushStatus>(
     DEFAULT_WEB_PUSH_STATUS,
@@ -440,6 +585,7 @@ export default function App() {
     setActiveTab('workbench');
     setSessionFilter('all');
     setShowAdvancedRelay(false);
+    previewControlsRef.current.clear();
     cursorRef.current = 0;
     setCursor(0);
   }, []);
@@ -639,6 +785,148 @@ export default function App() {
     [previewMode, savedDevice],
   );
 
+  const loadControlForSession = useCallback(
+    async (session: AgentSession): Promise<CodexControlSnapshot> => {
+      if (previewMode) {
+        const cached = previewControlsRef.current.get(
+          session.session_ref,
+        );
+        if (cached) return cached;
+        const created = previewControlSnapshot(session);
+        previewControlsRef.current.set(session.session_ref, created);
+        return created;
+      }
+      if (!savedDevice) throw new RelayError('尚未连接 Codexy Relay。');
+      return getSessionControl({
+        relayUrl: savedDevice.relayUrl,
+        deviceId: savedDevice.deviceId,
+        deviceSecret: savedDevice.deviceSecret,
+        sessionRef: session.session_ref,
+      });
+    },
+    [previewMode, savedDevice],
+  );
+
+  const loadReplySummaryForSession = useCallback(
+    async (session: AgentSession): Promise<CodexReplySummary> => {
+      if (previewMode) return previewReplySummary(session);
+      if (!savedDevice) throw new RelayError('尚未连接 Codexy Relay。');
+      return getSessionReplySummary({
+        relayUrl: savedDevice.relayUrl,
+        deviceId: savedDevice.deviceId,
+        deviceSecret: savedDevice.deviceSecret,
+        sessionRef: session.session_ref,
+      });
+    },
+    [previewMode, savedDevice],
+  );
+
+  const updateControlForSession = useCallback(
+    async (
+      session: AgentSession,
+      model: string,
+      reasoningEffort: string,
+    ): Promise<CodexControlSnapshot> => {
+      if (previewMode) {
+        const current =
+          previewControlsRef.current.get(session.session_ref) ??
+          previewControlSnapshot(session);
+        const selected = current.models.find(
+          (candidate) => candidate.id === model,
+        );
+        if (
+          !selected ||
+          !selected.supported_efforts.includes(reasoningEffort)
+        ) {
+          throw new RelayError('所选模型不支持这个思考强度。');
+        }
+        const next: CodexControlSnapshot = {
+          ...current,
+          model,
+          reasoning_effort: reasoningEffort,
+          refreshed_at: new Date().toISOString(),
+        };
+        previewControlsRef.current.set(session.session_ref, next);
+        return next;
+      }
+      if (!savedDevice) throw new RelayError('尚未连接 Codexy Relay。');
+      return updateSessionControl({
+        relayUrl: savedDevice.relayUrl,
+        deviceId: savedDevice.deviceId,
+        deviceSecret: savedDevice.deviceSecret,
+        sessionRef: session.session_ref,
+        model,
+        reasoningEffort,
+        idempotencyKey: createControlKey('settings'),
+      });
+    },
+    [previewMode, savedDevice],
+  );
+
+  const runControlForSession = useCallback(
+    async (
+      session: AgentSession,
+      action: CodexControlAction,
+    ): Promise<CodexControlActionResult> => {
+      if (previewMode) {
+        const current =
+          previewControlsRef.current.get(session.session_ref) ??
+          previewControlSnapshot(session);
+        const stopped = action === 'interrupt';
+        const next: CodexControlSnapshot = {
+          ...current,
+          session_state: stopped ? 'idle' : current.session_state,
+          available_actions: stopped
+            ? {
+                status: true,
+                compact: true,
+                review: true,
+                interrupt: false,
+              }
+            : current.available_actions,
+          refreshed_at: new Date().toISOString(),
+        };
+        previewControlsRef.current.set(session.session_ref, next);
+        if (stopped) {
+          setSessions((currentSessions) =>
+            currentSessions.map((candidate) =>
+              candidate.session_ref === session.session_ref
+                ? {
+                    ...candidate,
+                    state: 'interrupted',
+                    summary: '已从手机停止当前 Codex 回合。',
+                    updated_at: next.refreshed_at,
+                  }
+                : candidate,
+            ),
+          );
+        }
+        const detail: Record<CodexControlAction, string> = {
+          status: '电脑端状态已经刷新。',
+          compact: '已开始压缩上下文；完成后可继续下一轮。',
+          review: '已开始审查未提交改动。',
+          interrupt: '已请求停止当前回合。',
+        };
+        return {
+          action,
+          accepted: true,
+          detail: detail[action],
+          snapshot: next,
+        };
+      }
+      if (!savedDevice) throw new RelayError('尚未连接 Codexy Relay。');
+      return runSessionControlAction({
+        relayUrl: savedDevice.relayUrl,
+        deviceId: savedDevice.deviceId,
+        deviceSecret: savedDevice.deviceSecret,
+        sessionRef: session.session_ref,
+        action,
+        idempotencyKey: createControlKey(action),
+      });
+    },
+    [previewMode, savedDevice],
+  );
+
   const startPreview = useCallback(() => {
     const now = new Date().toISOString();
     const previewSessions: AgentSession[] = [
@@ -707,6 +995,11 @@ export default function App() {
         ],
       },
     ];
+    previewControlsRef.current.clear();
+    previewControlsRef.current.set(
+      previewSessions[0].session_ref,
+      previewControlSnapshot(previewSessions[0]),
+    );
     setPreviewMode(true);
     setPaired(true);
     setSessions(previewSessions);
@@ -998,8 +1291,9 @@ export default function App() {
             </Pressable>
 
             <Text style={styles.setupPrivacy}>
-              Codexy 不读取助手回复、代码和工具日志。状态推送与 Prompt
-              回放使用两条独立通道。Codexy 是非官方 Codex CLI 伴侣。
+              Codexy 只按需读取最近一次最终回复，并先在电脑端过滤敏感内容；
+              完整回复、代码和工具日志不会进入推送或持久状态。Codexy 是非官方
+              Codex CLI 伴侣。
             </Text>
           </ScrollView>
         </KeyboardAvoidingView>
@@ -1027,8 +1321,22 @@ export default function App() {
         }}
         onCancelPrompt={cancelPromptCommand}
         onClose={() => setSelectedSessionRef(null)}
+        onLoadControl={() => loadControlForSession(selectedSession)}
+        onLoadReplySummary={() =>
+          loadReplySummaryForSession(selectedSession)
+        }
+        onRunControlAction={(action) =>
+          runControlForSession(selectedSession, action)
+        }
         onSendPrompt={(prompt, mode) =>
           sendPromptToSession(selectedSession, prompt, mode)
+        }
+        onUpdateControl={(model, reasoningEffort) =>
+          updateControlForSession(
+            selectedSession,
+            model,
+            reasoningEffort,
+          )
         }
         online={previewMode || !connectionError}
         session={selectedSession}
@@ -1490,10 +1798,12 @@ export default function App() {
             </View>
             <View style={[styles.privacyCard, styles.privacyCardDark]}>
               <Text style={[styles.privacyTitle, styles.darkText]}>
-                Codexy 明确不读取
+                回复速览不保存完整回复
               </Text>
               <Text style={[styles.privacyBody, styles.darkMuted]}>
-                助手回复、代码文件、工具输入输出、终端日志和完整 transcript。
+                只按需读取最近一次最终回复，在电脑端过滤代码块、路径、链接、邮箱和疑似
+                密钥后返回 2–4 条速览；完整回复、工具日志和 transcript
+                不写入 Relay，也不进入推送。
               </Text>
             </View>
 

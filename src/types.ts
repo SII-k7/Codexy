@@ -83,6 +83,82 @@ export interface RemoteControlHealth {
   endpoint: 'localhost-only' | null;
 }
 
+export type CodexControlAction =
+  | 'status'
+  | 'compact'
+  | 'review'
+  | 'interrupt';
+
+export interface CodexModelOption {
+  id: string;
+  display_name: string;
+  description: string;
+  is_default: boolean;
+  supported_efforts: string[];
+  default_effort: string | null;
+}
+
+export interface CodexRateLimitWindow {
+  used_percent: number;
+  window_minutes: number | null;
+  resets_at: string | null;
+}
+
+export interface CodexControlSnapshot {
+  session_ref: string;
+  control_status: 'ready';
+  session_state: string;
+  model: string | null;
+  reasoning_effort: string | null;
+  approval_policy: string;
+  permission_profile: string;
+  settings_apply_to: 'subsequent_turns';
+  models: CodexModelOption[];
+  rate_limit: {
+    primary: CodexRateLimitWindow | null;
+    secondary: CodexRateLimitWindow | null;
+  } | null;
+  available_actions: Record<CodexControlAction, boolean>;
+  refreshed_at: string;
+}
+
+export interface CodexControlActionResult {
+  action: CodexControlAction;
+  accepted: boolean;
+  detail: string;
+  snapshot: CodexControlSnapshot;
+}
+
+export type CodexReplyHighlightKind =
+  | 'outcome'
+  | 'verification'
+  | 'attention'
+  | 'next'
+  | 'detail';
+
+export interface CodexReplyHighlight {
+  kind: CodexReplyHighlightKind;
+  label: string;
+  text: string;
+}
+
+export interface CodexReplySummary {
+  available: boolean;
+  session_ref: string;
+  current_turn_active: boolean;
+  reason: string | null;
+  turn_status: string | null;
+  completed_at: string | null;
+  headline: string | null;
+  highlights: CodexReplyHighlight[];
+  summary_method: 'local_extract';
+  source_characters: number;
+  source_truncated: boolean;
+  raw_response_exposed: false;
+  persisted: false;
+  generated_at: string;
+}
+
 export type RemotePromptMode = 'queue' | 'steer';
 
 export type RemotePromptStatus =

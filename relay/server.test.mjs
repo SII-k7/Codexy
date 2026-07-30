@@ -645,6 +645,272 @@ test('queues an exact reviewed Prompt for one controllable Codex session', async
   assert.equal(listed.body.commands[0].prompt, undefined);
 });
 
+test('controls one Codex session without exposing its thread id or path', async () => {
+  await new Promise((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+  const settingsCalls = [];
+  const actionCalls = [];
+  const sessionRef = 'sha256:cccccccccccccccccccccccc';
+  const snapshot = (overrides = {}) => ({
+    session_ref: sessionRef,
+    control_status: 'ready',
+    session_state: 'idle',
+    model: 'gpt-5.6-sol',
+    reasoning_effort: 'medium',
+    approval_policy: 'on-request',
+    permission_profile: 'read-only',
+    settings_apply_to: 'subsequent_turns',
+    models: [
+      {
+        id: 'gpt-5.6-sol',
+        display_name: 'GPT-5.6 Sol',
+        description: 'Frontier coding model',
+        is_default: true,
+        supported_efforts: ['low', 'medium', 'high', 'ultra'],
+        default_effort: 'medium',
+        local_path: 'F:\\private\\model-cache',
+      },
+    ],
+    rate_limit: {
+      primary: {
+        used_percent: 12,
+        window_minutes: 300,
+        resets_at: '2030-01-01T00:00:00.000Z',
+      },
+      secondary: null,
+    },
+    available_actions: {
+      status: true,
+      compact: true,
+      review: true,
+      interrupt: false,
+    },
+    refreshed_at: '2030-01-01T00:00:00.000Z',
+    thread_id: '019-secret-thread-id',
+    cwd: 'F:\\private\\project',
+    ...overrides,
+  });
+  const fakeControl = {
+    async start() {},
+    stop() {},
+    getStatus: () => ({
+      state: 'ready',
+      detail: 'test control is ready',
+      endpoint: 'localhost-only',
+    }),
+    statusForSession: () => 'ready',
+    dispatch: async () => ({ turnId: 'turn-control-test' }),
+    getSessionControl: async () => snapshot(),
+    getSessionResponseSummary: async () => ({
+      available: true,
+      session_ref: sessionRef,
+      current_turn_active: false,
+      reason: null,
+      turn_status: 'completed',
+      completed_at: '2030-01-01T00:00:00.000Z',
+      headline:
+        '已完成回复摘要，文件位于 F:\\private\\project\\reply.ts。',
+      highlights: [
+        {
+          kind: 'verification',
+          label: 'untrusted label',
+          text: '测试已通过，详情见 https://private.example.test。',
+        },
+      ],
+      summary_method: 'untrusted',
+      source_characters: 980,
+      source_truncated: false,
+      raw_response_exposed: true,
+      persisted: true,
+      raw_response: 'DO-NOT-EXPOSE-RAW-REPLY',
+      generated_at: '2030-01-01T00:00:00.000Z',
+    }),
+    async updateSessionSettings(receivedSessionRef, input) {
+      settingsCalls.push({ receivedSessionRef, input });
+      return snapshot({
+        model: input.model,
+        reasoning_effort: input.reasoningEffort,
+      });
+    },
+    async runSessionAction(receivedSessionRef, action) {
+      actionCalls.push({ receivedSessionRef, action });
+      return {
+        action,
+        accepted: true,
+        detail: `${action} accepted`,
+        snapshot: snapshot(),
+        internal_debug_path: 'F:\\private\\debug.log',
+      };
+    },
+  };
+  const created = createRelayServer({
+    codexControl: fakeControl,
+    pushSender: async () => ({ status: 'test_skipped' }),
+  });
+  server = created.server;
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const { deviceSecret, hookToken } = await registerAndPair();
+  const captured = await json('/v1/prompts', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${hookToken}` },
+    body: JSON.stringify({
+      session_ref: sessionRef,
+      source: 'codex',
+      project_alias: 'Control project',
+      prompt_id: 'control-source-prompt',
+      captured_at: new Date().toISOString(),
+      text: 'Prepare the session control test.',
+    }),
+  });
+  assert.equal(captured.status, 202);
+  const authorization = {
+    Authorization: `Bearer ${deviceSecret}`,
+  };
+
+  const unauthorized = await json(
+    `/v1/devices/device-test-123/sessions/${encodeURIComponent(sessionRef)}/control`,
+  );
+  assert.equal(unauthorized.status, 401);
+
+  const read = await json(
+    `/v1/devices/device-test-123/sessions/${encodeURIComponent(sessionRef)}/control`,
+    { headers: authorization },
+  );
+  assert.equal(read.status, 200);
+  assert.equal(read.body.snapshot.model, 'gpt-5.6-sol');
+  assert.equal(read.body.snapshot.models[0].local_path, undefined);
+  assert.equal(read.body.raw_thread_id_exposed, false);
+  assert.equal(read.body.working_directory_exposed, false);
+  assert.doesNotMatch(
+    JSON.stringify(read.body),
+    /019-secret-thread-id|private\\\\project|model-cache/i,
+  );
+
+  const replySummary = await json(
+    `/v1/devices/device-test-123/sessions/${encodeURIComponent(sessionRef)}/reply-summary`,
+    { headers: authorization },
+  );
+  assert.equal(replySummary.status, 200);
+  assert.equal(replySummary.body.summary.available, true);
+  assert.equal(
+    replySummary.body.summary.highlights[0].label,
+    '验证',
+  );
+  assert.equal(replySummary.body.summary.summary_method, 'local_extract');
+  assert.equal(replySummary.body.summary.raw_response_exposed, false);
+  assert.equal(replySummary.body.summary.persisted, false);
+  assert.equal(replySummary.body.raw_response_exposed, false);
+  assert.equal(replySummary.body.persisted, false);
+  assert.doesNotMatch(
+    JSON.stringify(replySummary.body),
+    /DO-NOT-EXPOSE|private\\\\project|private\.example/i,
+  );
+
+  const updateBody = {
+    model: 'gpt-5.6-sol',
+    reasoning_effort: 'ultra',
+    idempotency_key: 'control-settings-1',
+  };
+  const updated = await json(
+    `/v1/devices/device-test-123/sessions/${encodeURIComponent(sessionRef)}/control`,
+    {
+      method: 'PATCH',
+      headers: authorization,
+      body: JSON.stringify(updateBody),
+    },
+  );
+  const repeatedUpdate = await json(
+    `/v1/devices/device-test-123/sessions/${encodeURIComponent(sessionRef)}/control`,
+    {
+      method: 'PATCH',
+      headers: authorization,
+      body: JSON.stringify(updateBody),
+    },
+  );
+  assert.equal(updated.status, 200);
+  assert.equal(repeatedUpdate.status, 200);
+  assert.equal(updated.body.snapshot.reasoning_effort, 'ultra');
+  assert.equal(updated.body.applies_to, 'subsequent_turns');
+  assert.equal(settingsCalls.length, 1);
+  assert.deepEqual(settingsCalls[0], {
+    receivedSessionRef: sessionRef,
+    input: {
+      model: 'gpt-5.6-sol',
+      reasoningEffort: 'ultra',
+    },
+  });
+
+  const secondSessionRef = 'sha256:dddddddddddddddddddddddd';
+  await json('/v1/prompts', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${hookToken}` },
+    body: JSON.stringify({
+      session_ref: secondSessionRef,
+      source: 'codex',
+      project_alias: 'Second control project',
+      prompt_id: 'second-control-source-prompt',
+      captured_at: new Date().toISOString(),
+      text: 'Prepare a second independently controlled session.',
+    }),
+  });
+  const secondSessionUpdate = await json(
+    `/v1/devices/device-test-123/sessions/${encodeURIComponent(secondSessionRef)}/control`,
+    {
+      method: 'PATCH',
+      headers: authorization,
+      body: JSON.stringify(updateBody),
+    },
+  );
+  assert.equal(secondSessionUpdate.status, 200);
+  assert.equal(settingsCalls.length, 2);
+  assert.equal(
+    settingsCalls[1].receivedSessionRef,
+    secondSessionRef,
+  );
+
+  const actionBody = {
+    action: 'compact',
+    idempotency_key: 'control-action-1',
+  };
+  const action = await json(
+    `/v1/devices/device-test-123/sessions/${encodeURIComponent(sessionRef)}/actions`,
+    {
+      method: 'POST',
+      headers: authorization,
+      body: JSON.stringify(actionBody),
+    },
+  );
+  const repeatedAction = await json(
+    `/v1/devices/device-test-123/sessions/${encodeURIComponent(sessionRef)}/actions`,
+    {
+      method: 'POST',
+      headers: authorization,
+      body: JSON.stringify(actionBody),
+    },
+  );
+  assert.equal(action.status, 202);
+  assert.equal(repeatedAction.status, 202);
+  assert.equal(action.body.result.accepted, true);
+  assert.equal(actionCalls.length, 1);
+  assert.doesNotMatch(JSON.stringify(action.body), /private|debug\.log/i);
+
+  const invalid = await json(
+    `/v1/devices/device-test-123/sessions/${encodeURIComponent(sessionRef)}/actions`,
+    {
+      method: 'POST',
+      headers: authorization,
+      body: JSON.stringify({
+        action: 'delete',
+        idempotency_key: 'control-invalid-1',
+      }),
+    },
+  );
+  assert.equal(invalid.status, 400);
+});
+
 test('keeps exact remote Prompt text out of durable Relay state', async () => {
   await new Promise((resolve, reject) =>
     server.close((error) => (error ? reject(error) : resolve())),
