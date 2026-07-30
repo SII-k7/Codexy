@@ -1,16 +1,38 @@
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 const state = process.argv[2] ?? 'needs_you';
 const relayUrl =
   process.env.CODEXY_RELAY_URL ??
   process.env.ATTENTION_RELAY_URL ??
   'http://127.0.0.1:8797/v1/events';
+function tokenFromLocalState() {
+  const statePath =
+    process.env.CODEXY_RELAY_STATE_FILE ??
+    process.env.ATTENTION_RELAY_STATE_FILE ??
+    join(homedir(), '.codex', 'codexy', 'relay-state.json');
+  try {
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    const tokens = (Array.isArray(state.devices) ? state.devices : [])
+      .map((device) => device?.hookToken)
+      .filter((candidate) => typeof candidate === 'string' && candidate);
+    return tokens.length === 1 ? tokens[0] : null;
+  } catch {
+    return null;
+  }
+}
+
 const token =
   process.env.CODEXY_RELAY_TOKEN ??
-  process.env.ATTENTION_RELAY_TOKEN;
+  process.env.ATTENTION_RELAY_TOKEN ??
+  tokenFromLocalState();
 
 if (!token) {
-  console.error('CODEXY_RELAY_TOKEN is required. Claim a pairing code first.');
+  console.error(
+    'No single paired Codexy device was found. Pair the phone first or set CODEXY_RELAY_TOKEN.',
+  );
   process.exit(1);
 }
 

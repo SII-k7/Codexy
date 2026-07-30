@@ -26,10 +26,13 @@ try {
     throw new Error(result.error ?? `HTTP ${response.status}`);
   }
 
-  console.log('Codexy pairing complete. Optional per-terminal overrides:');
-  console.log(`$env:CODEXY_RELAY_URL='${relayUrl}/v1/events'`);
-  console.log(`$env:CODEXY_RELAY_TOKEN='${result.relay_token}'`);
-  console.log(`$env:CODEXY_PROJECT_ALIAS='My project'`);
+  console.log('Codexy pairing complete.');
+  console.log(
+    'Installed hooks will discover this single paired device from the local Relay state.',
+  );
+  console.log(
+    "No bearer token is printed. Optional project alias: $env:CODEXY_PROJECT_ALIAS='My project'",
+  );
 } catch (error) {
   console.error(
     `Pairing failed: ${error instanceof Error ? error.message : String(error)}`,
