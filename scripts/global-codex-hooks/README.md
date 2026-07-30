@@ -1,14 +1,15 @@
 # Codexy Codex hooks
 
-This is the reviewed, Codex-only hook bundle for Codexy. Install these five
+This is the reviewed, Codex-only hook bundle for Codexy. Install these
 runtime files under:
 
 `%USERPROFILE%\.codex\codexy-hooks`
 
 - `capture_prompt.cmd`
-- `capture_prompt.py`
+- `capture_prompt.mjs`
+- `hook_common.mjs`
 - `notify_mobile.cmd`
-- `notify_mobile.py`
+- `notify_mobile.mjs`
 - `hooks.json` (the hook definitions to review and merge into Codex)
 
 The hook commands in `hooks.json` use `%USERPROFILE%`; they do not contain a
@@ -23,7 +24,8 @@ developer machine path or a path back to this repository.
   addresses, and suspected secrets.
 
 Prompt text is never included in a push notification. Assistant messages,
-transcripts, tool inputs, tool outputs, and shell history are not read.
+transcripts, tool inputs, tool outputs, and shell history are not read. The
+hooks use Codexy's required Node.js runtime; Python is not required.
 
 ## Isolated defaults
 
@@ -42,7 +44,7 @@ Useful overrides are:
 - `CODEXY_RELAY_TOKEN`
 - `CODEXY_RELAY_STATE_FILE`
 - `CODEXY_PROJECT_ALIAS`
-- `CODEXY_PYTHON`
+- `CODEXY_NODE`
 - `CODEXY_HOOK_LOG`
 
 The installed commands always return success, so notification or Relay

@@ -113,11 +113,16 @@ export function RemotePromptComposer(props: {
   const [reviewing, setReviewing] = useState(false);
   const [sending, setSending] = useState(false);
   const [canceling, setCanceling] = useState(false);
+  const [pendingCommandId, setPendingCommandId] = useState<string | null>(null);
   const [error, setError] = useState('');
   const controlStatus = props.session.control_status ?? 'setup_required';
   const controlCopy = CONTROL_COPY[controlStatus];
   const normalizedDraft = draft.trim();
-  const canSend = controlStatus === 'ready' && props.online;
+  const commandPending =
+    props.latestCommand !== null &&
+    ['queued', 'waiting', 'dispatching'].includes(props.latestCommand.status);
+  const canSend =
+    controlStatus === 'ready' && props.online && !commandPending;
   const canSteer = canSend && props.session.state === 'working';
   const characterCount = draft.length;
   const signals = useMemo(() => promptSignals(normalizedDraft), [normalizedDraft]);
@@ -149,6 +154,7 @@ export function RemotePromptComposer(props: {
 
   useEffect(() => {
     let active = true;
+    setPendingCommandId(null);
     setDraftLoaded(false);
     void loadPromptDraft(props.session.session_ref).then((savedDraft) => {
       if (!active) return;
@@ -159,6 +165,25 @@ export function RemotePromptComposer(props: {
       active = false;
     };
   }, [props.session.session_ref]);
+
+  useEffect(() => {
+    const command = props.latestCommand;
+    if (!command || command.command_id !== pendingCommandId) return;
+    if (command.status === 'sent') {
+      setDraft('');
+      void savePromptDraft(props.session.session_ref, '');
+      setPendingCommandId(null);
+      return;
+    }
+    if (['failed', 'canceled', 'expired'].includes(command.status)) {
+      setPendingCommandId(null);
+      setError(
+        command.status === 'canceled'
+          ? '指令已撤回，草稿仍保留在手机。'
+          : `${command.status_detail} 草稿仍保留在手机，可修改后重试。`,
+      );
+    }
+  }, [pendingCommandId, props.latestCommand, props.session.session_ref]);
 
   useEffect(() => {
     if (!draftLoaded) return;
@@ -180,9 +205,8 @@ export function RemotePromptComposer(props: {
     setSending(true);
     setError('');
     try {
-      await props.onSend(normalizedDraft, mode);
-      setDraft('');
-      await savePromptDraft(props.session.session_ref, '');
+      const command = await props.onSend(normalizedDraft, mode);
+      setPendingCommandId(command.command_id);
       setMode('queue');
       setReviewing(false);
     } catch (sendError) {
@@ -233,6 +257,11 @@ export function RemotePromptComposer(props: {
       {!props.online ? (
         <Text accessibilityRole="alert" style={styles.offlineNotice}>
           电脑暂时不可达。草稿仍保存在手机；恢复连接前不会发送，也不会显示假成功。
+        </Text>
+      ) : null}
+      {commandPending ? (
+        <Text style={styles.pendingNotice}>
+          当前指令送达前，草稿会继续保存在手机；确认送达后才自动清除。
         </Text>
       ) : null}
 
@@ -560,6 +589,16 @@ const styles = StyleSheet.create({
     lineHeight: 17,
     marginTop: 12,
     padding: 11,
+  },
+  pendingNotice: {
+    backgroundColor: '#EEE9DA',
+    borderRadius: 12,
+    color: '#625C4E',
+    fontSize: 10,
+    lineHeight: 15,
+    marginBottom: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
   },
   receipt: {
     backgroundColor: '#F1F0EB',

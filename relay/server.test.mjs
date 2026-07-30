@@ -15,6 +15,7 @@ import { shouldNotifyForLevel } from './notifications.mjs';
 
 let server;
 let baseUrl;
+let relayStore;
 let tempDirectories;
 
 async function json(path, init = {}) {
@@ -32,11 +33,11 @@ async function json(path, init = {}) {
   };
 }
 
-async function registerAndPair() {
+async function registerAndPair(deviceId = 'device-test-123') {
   const registration = await json('/v1/devices/register', {
     method: 'POST',
     body: JSON.stringify({
-      device_id: 'device-test-123',
+      device_id: deviceId,
       platform: 'test',
       expo_push_token: null,
     }),
@@ -63,6 +64,7 @@ beforeEach(async () => {
     pushSender: async () => ({ status: 'test_skipped' }),
   });
   server = created.server;
+  relayStore = created.store;
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   baseUrl = `http://127.0.0.1:${address.port}`;
@@ -81,6 +83,128 @@ test('reports the isolated Codexy Relay identity', async () => {
   const health = await json('/health');
   assert.equal(health.status, 200);
   assert.equal(health.body.service, 'codexy-relay');
+});
+
+test('rejects untrusted browser origins and reflects the same origin only', async () => {
+  const rejected = await json('/health', {
+    headers: { Origin: 'https://evil.example' },
+  });
+  assert.equal(rejected.status, 403);
+  assert.equal(rejected.body.error_code, 'origin_not_allowed');
+
+  const response = await fetch(`${baseUrl}/health`, {
+    headers: { Origin: baseUrl },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('access-control-allow-origin'), baseUrl);
+});
+
+test('rate limits device registration and pairing attempts', async () => {
+  await new Promise((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+  const created = createRelayServer({
+    pushSender: async () => ({ status: 'test_skipped' }),
+    rateLimitOptions: {
+      pairingClaimLimit: 1,
+      registrationLimit: 1,
+      windowMs: 60_000,
+    },
+  });
+  server = created.server;
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const first = await json('/v1/devices/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      device_id: 'device-limited-1',
+      platform: 'test',
+    }),
+  });
+  assert.equal(first.status, 200);
+  const second = await json('/v1/devices/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      device_id: 'device-limited-2',
+      platform: 'test',
+    }),
+  });
+  assert.equal(second.status, 429);
+  assert.equal(second.body.error_code, 'registration_rate_limited');
+
+  const invalidClaim = await json('/v1/pairings/claim', {
+    method: 'POST',
+    body: JSON.stringify({ pairing_code: '999999' }),
+  });
+  assert.equal(invalidClaim.status, 404);
+  const limitedClaim = await json('/v1/pairings/claim', {
+    method: 'POST',
+    body: JSON.stringify({ pairing_code: first.body.pairing_code }),
+  });
+  assert.equal(limitedClaim.status, 429);
+  assert.equal(limitedClaim.body.error_code, 'pairing_rate_limited');
+});
+
+test('activating a new phone revokes the previous hook token', async () => {
+  const first = await registerAndPair('device-first-123');
+  const second = await registerAndPair('device-second-123');
+
+  const firstStatus = await json('/v1/devices/device-first-123/status', {
+    headers: { Authorization: `Bearer ${first.deviceSecret}` },
+  });
+  assert.equal(firstStatus.status, 200);
+  assert.equal(firstStatus.body.paired, false);
+
+  const rejectedEvent = await json('/v1/events', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${first.hookToken}` },
+    body: JSON.stringify({
+      event_id: 'revoked-device-event',
+      dedupe_key: 'revoked-device-event',
+      source: 'codex',
+      state: 'turn_finished',
+    }),
+  });
+  assert.equal(rejectedEvent.status, 401);
+
+  const acceptedEvent = await json('/v1/events', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${second.hookToken}` },
+    body: JSON.stringify({
+      event_id: 'active-device-event',
+      dedupe_key: 'active-device-event',
+      source: 'codex',
+      state: 'turn_finished',
+    }),
+  });
+  assert.equal(acceptedEvent.status, 202);
+});
+
+test('deletes an authenticated phone and revokes its credentials', async () => {
+  const { deviceSecret, hookToken } = await registerAndPair();
+  const removed = await json('/v1/devices/device-test-123', {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${deviceSecret}` },
+  });
+  assert.equal(removed.status, 200);
+  assert.equal(removed.body.deleted, true);
+
+  const status = await json('/v1/devices/device-test-123/status', {
+    headers: { Authorization: `Bearer ${deviceSecret}` },
+  });
+  assert.equal(status.status, 404);
+  const event = await json('/v1/events', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${hookToken}` },
+    body: JSON.stringify({
+      event_id: 'deleted-device-event',
+      dedupe_key: 'deleted-device-event',
+      source: 'codex',
+      state: 'turn_finished',
+    }),
+  });
+  assert.equal(event.status, 401);
 });
 
 test('returns and updates authenticated device notification preferences', async () => {
@@ -535,6 +659,47 @@ test('tracks parallel sessions with ten privacy-filtered prompts each', async ()
   assert.match(latestText, /\[path\]/);
   assert.match(latestText, /\[redacted\]/);
   assert.match(latestText, /\[link\]/);
+});
+
+test('removes prompts older than 24 hours from an otherwise active session', async () => {
+  const { deviceSecret, hookToken } = await registerAndPair();
+  const sessionRef = 'sha256:abcabcabcabcabcabcabcabc';
+  const current = new Date().toISOString();
+  const captured = await json('/v1/prompts', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${hookToken}` },
+    body: JSON.stringify({
+      session_ref: sessionRef,
+      source: 'codex',
+      project_alias: 'Retention project',
+      prompt_id: 'retention-current',
+      captured_at: current,
+      text: '保留这条当前指令。',
+    }),
+  });
+  assert.equal(captured.status, 202);
+
+  const device = relayStore.devices.get('device-test-123');
+  const session = device.agentSessions.find(
+    (candidate) => candidate.session_ref === sessionRef,
+  );
+  session.prompts.unshift({
+    prompt_id: 'retention-expired',
+    captured_at: new Date(
+      Date.now() - 25 * 60 * 60 * 1000,
+    ).toISOString(),
+    text: '这条指令已经超过保留时间。',
+  });
+  session.updated_at = current;
+  const currentSessions = await json(
+    '/v1/devices/device-test-123/sessions',
+    { headers: { Authorization: `Bearer ${deviceSecret}` } },
+  );
+  assert.equal(currentSessions.body.sessions[0].prompt_count, 1);
+  assert.equal(
+    currentSessions.body.sessions[0].prompts[0].prompt_id,
+    'retention-current',
+  );
 });
 
 test('queues an exact reviewed Prompt for one controllable Codex session', async () => {
@@ -1164,6 +1329,41 @@ test('restores paired devices and Web Push subscriptions from local state', asyn
   assert.equal(sessions.body.sessions[0].prompt_count, 1);
 });
 
+test('recovers the last valid Relay state after an interrupted write', async () => {
+  await new Promise((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+  const directory = mkdtempSync(join(tmpdir(), 'codexy-recovery-test-'));
+  tempDirectories.push(directory);
+  const stateFile = join(directory, 'state.json');
+  let created = createRelayServer({ stateFile });
+  server = created.server;
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const { deviceSecret } = await registerAndPair();
+  const updated = await json('/v1/devices/device-test-123/preferences', {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${deviceSecret}` },
+    body: JSON.stringify({ notification_tone: 'direct' }),
+  });
+  assert.equal(updated.status, 200);
+  await new Promise((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+
+  writeFileSync(stateFile, '{"interrupted":', 'utf8');
+  created = createRelayServer({ stateFile });
+  server = created.server;
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const restored = await json('/v1/devices/device-test-123/status', {
+    headers: { Authorization: `Bearer ${deviceSecret}` },
+  });
+  assert.equal(restored.status, 200);
+  assert.equal(restored.body.paired, true);
+});
+
 test('serves the private PWA with conservative security and cache headers', async () => {
   await new Promise((resolve, reject) =>
     server.close((error) => (error ? reject(error) : resolve())),
@@ -1190,6 +1390,14 @@ test('serves the private PWA with conservative security and cache headers', asyn
   assert.equal(response.headers.get('cache-control'), 'no-cache');
   assert.equal(response.headers.get('permissions-policy'), 'camera=(), microphone=(), geolocation=()');
   assert.equal(response.headers.get('x-frame-options'), 'DENY');
+  assert.match(
+    response.headers.get('content-security-policy'),
+    /default-src 'self'/,
+  );
+  assert.equal(
+    response.headers.get('strict-transport-security'),
+    'max-age=31536000',
+  );
 
   const worker = await fetch(`${baseUrl}/sw.js`);
   assert.equal(worker.headers.get('cache-control'), 'no-cache');

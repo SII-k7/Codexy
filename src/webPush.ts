@@ -20,3 +20,13 @@ export async function enableWebPush(_input: {
 }): Promise<WebPushStatus> {
   return DEFAULT_WEB_PUSH_STATUS;
 }
+
+export async function syncWebPush(_input: {
+  relayUrl: string;
+  deviceId: string;
+  deviceSecret: string;
+}): Promise<WebPushStatus> {
+  return DEFAULT_WEB_PUSH_STATUS;
+}
+
+export async function disableWebPush(): Promise<void> {}

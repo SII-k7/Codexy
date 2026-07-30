@@ -60,6 +60,7 @@ for (const key of [
 }
 setValue('CODEXY_RELAY_HOST', '127.0.0.1');
 setValue('CODEXY_RELAY_PORT', '8797');
+setValue('CODEXY_NODE_COMMAND', JSON.stringify(process.execPath));
 setValue(
   'CODEXY_RELAY_STATE_FILE',
   join(homedir(), '.codex', 'codexy', 'relay-state.json').replaceAll(
@@ -76,6 +77,16 @@ setValue(
   currentValue('CODEXY_CODEX_APP_SERVER_URL') ||
     'ws://127.0.0.1:4510',
 );
+const configuredCodexCommand =
+  currentValue('CODEXY_CODEX_COMMAND').replace(/^"(.*)"$/, '$1') ||
+  process.env.CODEXY_CODEX_COMMAND ||
+  '';
+if (configuredCodexCommand) {
+  setValue(
+    'CODEXY_CODEX_COMMAND',
+    JSON.stringify(configuredCodexCommand),
+  );
+}
 setValue(
   'CODEXY_VAPID_SUBJECT',
   currentValue('CODEXY_VAPID_SUBJECT') ||

@@ -10,6 +10,8 @@ const appJson = readJson('app.json');
 const manifest = readJson('public/manifest.json');
 const serviceWorker = readText('public/sw.js');
 const envExample = readText('.env.example');
+const hookInstaller = readText('scripts/install-global-hooks.ps1');
+const startupScript = readText('scripts/start-private-pwa.ps1');
 const expo = appJson.expo;
 
 const failures = [];
@@ -51,6 +53,37 @@ requireValue(
 requireValue(
   packageJson.scripts?.['preview:iphone']?.includes('--port 8084'),
   'iPhone 预览端口必须是 8084',
+);
+requireValue(
+  packageJson.scripts?.['update:apply']?.includes('update-codexy.ps1'),
+  '缺少安全更新入口',
+);
+requireValue(
+  hookInstaller.includes('capture_prompt.mjs') &&
+    hookInstaller.includes('notify_mobile.mjs') &&
+    !existsSync(
+      resolve(root, 'scripts/global-codex-hooks/capture_prompt.py'),
+    ) &&
+    !existsSync(
+      resolve(root, 'scripts/global-codex-hooks/notify_mobile.py'),
+    ),
+  '全局 Hook 必须只依赖 Node.js 运行时',
+);
+requireValue(
+  !existsSync(resolve(root, '.codex/hooks.project-template.json')) &&
+    !existsSync(resolve(root, '.codex/hooks/capture_prompt.cmd')) &&
+    !existsSync(resolve(root, '.codex/hooks/capture_prompt.py')) &&
+    !existsSync(resolve(root, '.codex/hooks/notify_mobile.cmd')) &&
+    !existsSync(resolve(root, '.codex/hooks/notify_mobile.py')),
+  '仓库不得保留旧的项目级 Attention/Python Hook',
+);
+requireValue(
+  !startupScript.includes('E:\\vibe coding'),
+  '启动脚本不得包含开发机 Node 路径',
+);
+requireValue(
+  envExample.includes('CODEXY_ALLOWED_ORIGINS='),
+  '缺少显式开发 Origin 配置',
 );
 
 for (const file of [

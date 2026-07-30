@@ -15,14 +15,20 @@ $sourceDirectory = Join-Path $PSScriptRoot 'global-codex-hooks'
 $codexHome = Join-Path $env:USERPROFILE '.codex'
 $targetDirectory = Join-Path $codexHome 'codexy-hooks'
 $globalHooksPath = Join-Path $codexHome 'hooks.json'
+$globalHooksBackupPath = Join-Path $codexHome 'hooks.json.codexy-backup'
 $sourceHooksPath = Join-Path $sourceDirectory 'hooks.json'
 $managedFiles = @(
   'capture_prompt.cmd',
-  'capture_prompt.py',
+  'capture_prompt.mjs',
+  'hook_common.mjs',
   'notify_mobile.cmd',
-  'notify_mobile.py',
+  'notify_mobile.mjs',
   'hooks.json',
   'README.md'
+)
+$retiredManagedFiles = @(
+  'capture_prompt.py',
+  'notify_mobile.py'
 )
 
 function Test-CodexyHook {
@@ -144,6 +150,12 @@ foreach ($fileName in $managedFiles) {
     -Destination (Join-Path $targetDirectory $fileName) `
     -Force
 }
+foreach ($fileName in $retiredManagedFiles) {
+  $retiredFile = Join-Path $targetDirectory $fileName
+  if (Test-Path -LiteralPath $retiredFile -PathType Leaf) {
+    Remove-Item -LiteralPath $retiredFile -Force
+  }
+}
 
 $marker = [pscustomobject][ordered]@{
   managedBy = 'Codexy'
@@ -158,11 +170,25 @@ $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
 )
 
 New-Item -ItemType Directory -Path $codexHome -Force | Out-Null
+if (Test-Path -LiteralPath $globalHooksPath -PathType Leaf) {
+  Copy-Item `
+    -LiteralPath $globalHooksPath `
+    -Destination $globalHooksBackupPath `
+    -Force
+}
+$temporaryHooksPath = Join-Path $codexHome "hooks.json.codexy-$PID.tmp"
 [System.IO.File]::WriteAllText(
-  $globalHooksPath,
+  $temporaryHooksPath,
   ($targetConfig | ConvertTo-Json -Depth 30),
   $utf8WithoutBom
 )
+Move-Item `
+  -LiteralPath $temporaryHooksPath `
+  -Destination $globalHooksPath `
+  -Force
 
 Write-Output 'Installed Codexy hook runtime files and merged Codexy entries.'
+if (Test-Path -LiteralPath $globalHooksBackupPath -PathType Leaf) {
+  Write-Output "Previous hook configuration backup: $globalHooksBackupPath"
+}
 Write-Output 'Review and trust the new commands in Codex with /hooks.'

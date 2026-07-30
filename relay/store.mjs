@@ -1,4 +1,16 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  closeSync,
+  copyFileSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
 import { normalizeDevicePreferences } from './notifications.mjs';
@@ -11,6 +23,7 @@ const MAX_PROMPTS_PER_SESSION = 10;
 
 function emptyStore() {
   return {
+    activeDeviceId: null,
     devices: new Map(),
     hookTokens: new Map(),
   };
@@ -188,7 +201,13 @@ export function loadRelayStore(stateFile) {
     parsed = JSON.parse(readFileSync(absolutePath, 'utf8'));
   } catch (error) {
     if (error?.code === 'ENOENT') return emptyStore();
-    throw new Error(`could not read Relay state: ${error.message}`);
+    const backupPath = `${absolutePath}.bak`;
+    try {
+      parsed = JSON.parse(readFileSync(backupPath, 'utf8'));
+      console.warn('Recovered Codexy Relay state from its local backup.');
+    } catch {
+      throw new Error(`could not read Relay state: ${error.message}`);
+    }
   }
 
   if (
@@ -207,6 +226,19 @@ export function loadRelayStore(stateFile) {
     if (device.hookToken) {
       store.hookTokens.set(device.hookToken, device.deviceId);
     }
+  }
+  const storedActiveDeviceId = storedString(parsed.activeDeviceId, 128);
+  if (
+    storedActiveDeviceId &&
+    store.devices.get(storedActiveDeviceId)?.hookToken
+  ) {
+    store.activeDeviceId = storedActiveDeviceId;
+  } else {
+    const paired = [...store.devices.values()].filter(
+      (device) => device.hookToken,
+    );
+    store.activeDeviceId =
+      paired.length === 1 ? paired[0].deviceId : null;
   }
   return store;
 }
@@ -229,9 +261,49 @@ export function persistRelayStore(stateFile, store) {
     webPushSubscriptions: device.webPushSubscriptions ?? [],
     preferences: normalizeDevicePreferences(device.preferences),
   }));
-  writeFileSync(
-    absolutePath,
-    `${JSON.stringify({ version: STORE_VERSION, devices }, null, 2)}\n`,
-    { encoding: 'utf8', mode: 0o600 },
-  );
+  const serialized = `${JSON.stringify(
+    {
+      version: STORE_VERSION,
+      activeDeviceId: store.activeDeviceId ?? null,
+      devices,
+    },
+    null,
+    2,
+  )}\n`;
+  const temporaryPath = `${absolutePath}.${process.pid}.${Date.now()}.tmp`;
+  const backupPath = `${absolutePath}.bak`;
+  let descriptor = null;
+  try {
+    writeFileSync(temporaryPath, serialized, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    descriptor = openSync(temporaryPath, 'r+');
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = null;
+    if (existsSync(absolutePath)) {
+      copyFileSync(absolutePath, backupPath);
+      try {
+        chmodSync(backupPath, 0o600);
+      } catch {
+        // Windows protects this user-profile file through inherited ACLs.
+      }
+    }
+    renameSync(temporaryPath, absolutePath);
+    try {
+      chmodSync(absolutePath, 0o600);
+    } catch {
+      // Windows protects this user-profile file through inherited ACLs.
+    }
+  } finally {
+    if (descriptor !== null) closeSync(descriptor);
+    if (existsSync(temporaryPath)) {
+      try {
+        unlinkSync(temporaryPath);
+      } catch {
+        // A later write uses a unique temporary path.
+      }
+    }
+  }
 }

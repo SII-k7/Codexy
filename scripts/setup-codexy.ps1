@@ -178,8 +178,18 @@ try {
     }
   }
 
-  Invoke-Checked -Label 'Prepare the private Codexy PWA' -Action {
-    & $npm.Source run private:prepare
+  $previousCodexCommand = $env:CODEXY_CODEX_COMMAND
+  try {
+    $env:CODEXY_CODEX_COMMAND = $codex.Source
+    Invoke-Checked -Label 'Prepare the private Codexy PWA' -Action {
+      & $npm.Source run private:prepare
+    }
+  } finally {
+    if ($null -eq $previousCodexCommand) {
+      Remove-Item Env:CODEXY_CODEX_COMMAND -ErrorAction SilentlyContinue
+    } else {
+      $env:CODEXY_CODEX_COMMAND = $previousCodexCommand
+    }
   }
 
   Write-Output ''

@@ -54,6 +54,98 @@ async function existingSubscription(): Promise<PushSubscription | null> {
   return registration?.pushManager.getSubscription() ?? null;
 }
 
+function subscriptionUsesKey(
+  subscription: PushSubscription,
+  expected: Uint8Array<ArrayBuffer>,
+): boolean {
+  const configured = subscription.options.applicationServerKey;
+  if (!configured) return false;
+  const actual = new Uint8Array(configured);
+  return (
+    actual.length === expected.length &&
+    actual.every((value, index) => value === expected[index])
+  );
+}
+
+async function publicKeyForRelay(relayUrl: string): Promise<string> {
+  const response = await fetch(
+    `${normalizeRelayUrl(relayUrl)}/v1/web-push/vapid-public-key`,
+    { headers: { Accept: 'application/json' } },
+  );
+  const body = (await response.json().catch(() => ({}))) as {
+    public_key?: string;
+    error?: string;
+  };
+  if (!response.ok || !body.public_key) {
+    throw new Error(
+      body.error === 'web push is not configured'
+        ? '这台电脑还没有完成私有推送配置。'
+        : '无法从私有 Relay 取得推送公钥。',
+    );
+  }
+  return body.public_key;
+}
+
+async function saveSubscription(
+  input: {
+    relayUrl: string;
+    deviceId: string;
+    deviceSecret: string;
+  },
+  subscription: PushSubscription,
+): Promise<void> {
+  const response = await fetch(
+    `${normalizeRelayUrl(input.relayUrl)}/v1/devices/${encodeURIComponent(input.deviceId)}/web-push-subscriptions`,
+    {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${input.deviceSecret}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ subscription: subscription.toJSON() }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error('浏览器已允许通知，但 Relay 尚未保存这台设备。');
+  }
+}
+
+async function synchronizeSubscription(
+  input: {
+    relayUrl: string;
+    deviceId: string;
+    deviceSecret: string;
+  },
+  createIfMissing: boolean,
+): Promise<WebPushStatus> {
+  const publicKey = await publicKeyForRelay(input.relayUrl);
+  const expectedKey = base64UrlToUint8Array(publicKey);
+  const registration =
+    (await navigator.serviceWorker.getRegistration()) ??
+    (await navigator.serviceWorker.register('/sw.js', { scope: '/' }));
+  await navigator.serviceWorker.ready;
+  let subscription = await registration.pushManager.getSubscription();
+  if (subscription && !subscriptionUsesKey(subscription, expectedKey)) {
+    await subscription.unsubscribe();
+    subscription = null;
+  }
+  if (!subscription && createIfMissing) {
+    subscription = await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: expectedKey,
+    });
+  }
+  if (!subscription) return DEFAULT_WEB_PUSH_STATUS;
+  await saveSubscription(input, subscription);
+  return {
+    phase: 'subscribed',
+    label: '后台通知已启用',
+    detail: '浏览器订阅与电脑 Relay 已核对，可以接收后台提醒。',
+    canEnable: false,
+  };
+}
+
 export const DEFAULT_WEB_PUSH_STATUS: WebPushStatus = {
   phase: 'ready',
   label: '可启用',
@@ -98,8 +190,8 @@ export async function getWebPushStatus(): Promise<WebPushStatus> {
     if (await existingSubscription()) {
       return {
         phase: 'subscribed',
-        label: '后台通知已启用',
-        detail: '只推送项目别名、状态与短摘要，不发送原始 Prompt 或代码。',
+        label: '浏览器已允许通知',
+        detail: '连接电脑后会自动核对 Relay 订阅与推送密钥。',
         canEnable: false,
       };
     }
@@ -107,6 +199,31 @@ export async function getWebPushStatus(): Promise<WebPushStatus> {
     return errorStatus('暂时无法读取通知状态，可以稍后重试。');
   }
   return DEFAULT_WEB_PUSH_STATUS;
+}
+
+export async function syncWebPush(input: {
+  relayUrl: string;
+  deviceId: string;
+  deviceSecret: string;
+}): Promise<WebPushStatus> {
+  const status = await getWebPushStatus();
+  if (
+    ['unsupported', 'insecure', 'install-required', 'denied'].includes(
+      status.phase,
+    )
+  ) {
+    return status;
+  }
+  if (permissionStatus() !== 'granted') return status;
+  try {
+    return await synchronizeSubscription(input, true);
+  } catch (error) {
+    return errorStatus(
+      error instanceof Error
+        ? error.message
+        : '无法核对电脑端的后台通知订阅。',
+    );
+  }
 }
 
 export async function enableWebPush(input: {
@@ -141,61 +258,22 @@ export async function enableWebPush(input: {
         : errorStatus('你暂时没有允许通知，可以需要时再开启。');
     }
 
-    const relayUrl = normalizeRelayUrl(input.relayUrl);
-    const keyResponse = await fetch(
-      `${relayUrl}/v1/web-push/vapid-public-key`,
-      { headers: { Accept: 'application/json' } },
-    );
-    const keyBody = (await keyResponse.json().catch(() => ({}))) as {
-      public_key?: string;
-      error?: string;
-    };
-    if (!keyResponse.ok || !keyBody.public_key) {
-      return errorStatus(
-        keyBody.error === 'web push is not configured'
-          ? '这台电脑还没有完成私有推送配置。'
-          : '无法从私有 Relay 取得推送公钥。',
-      );
-    }
-
-    const registration =
-      (await navigator.serviceWorker.getRegistration()) ??
-      (await navigator.serviceWorker.register('/sw.js', { scope: '/' }));
-    await navigator.serviceWorker.ready;
-    const subscription =
-      (await registration.pushManager.getSubscription()) ??
-      (await registration.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: base64UrlToUint8Array(keyBody.public_key),
-      }));
-
-    const saveResponse = await fetch(
-      `${relayUrl}/v1/devices/${encodeURIComponent(input.deviceId)}/web-push-subscriptions`,
-      {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          Authorization: `Bearer ${input.deviceSecret}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ subscription: subscription.toJSON() }),
-      },
-    );
-    if (!saveResponse.ok) {
-      return errorStatus('浏览器已允许通知，但 Relay 尚未保存这台设备。');
-    }
-
-    return {
-      phase: 'subscribed',
-      label: '后台通知已启用',
-      detail: '只推送项目别名、状态与短摘要，不发送原始 Prompt 或代码。',
-      canEnable: false,
-    };
+    return await synchronizeSubscription(input, true);
   } catch (error) {
     const message =
       error instanceof Error && error.name === 'NotAllowedError'
         ? '系统没有允许通知；你可以稍后从设置中重新开启。'
         : '启用后台通知时遇到问题，请确认私有 HTTPS 地址仍可访问。';
     return errorStatus(message);
+  }
+}
+
+export async function disableWebPush(): Promise<void> {
+  if (!('serviceWorker' in navigator)) return;
+  try {
+    const subscription = await existingSubscription();
+    await subscription?.unsubscribe();
+  } catch {
+    // Device deletion on the Relay is authoritative; local cleanup is best effort.
   }
 }

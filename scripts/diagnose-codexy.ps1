@@ -105,6 +105,8 @@ $codexHome = Join-Path $env:USERPROFILE '.codex'
 $hookDirectory = Join-Path $codexHome 'codexy-hooks'
 $hookMarker = Join-Path $hookDirectory '.codexy-managed.json'
 $globalHooksPath = Join-Path $codexHome 'hooks.json'
+$relayLogPath = Join-Path $codexHome 'codexy\relay.log'
+$hookLogPath = Join-Path $codexHome 'codexy\hook.log'
 $hookEntryCount = 0
 $hookConfigStatus = 'not installed'
 if (Test-Path -LiteralPath $globalHooksPath -PathType Leaf) {
@@ -169,5 +171,7 @@ Write-Output "Port 4510  : $(Get-PortStatus -Port 4510) (localhost Codex App Ser
 Write-Output "Hook files : $runtimeStatus"
 Write-Output "Hook config: $hookConfigStatus"
 Write-Output "Launcher   : $launcherStatus"
+Write-Output "Relay log  : $(if (Test-Path -LiteralPath $relayLogPath) { $relayLogPath } else { 'not created yet' })"
+Write-Output "Hook log   : $(if (Test-Path -LiteralPath $hookLogPath) { $hookLogPath } else { 'not created yet' })"
 Write-Output ''
 Write-Output 'This command made no changes.'

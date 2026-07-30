@@ -32,6 +32,9 @@ const DEFAULT_PAIRING_TTL_MS = 10 * 60 * 1000;
 const MAX_REMOTE_PROMPT_LENGTH = 4_000;
 const MAX_CONTROL_REQUESTS = 100;
 const CONTROL_REQUEST_RETENTION_MS = 10 * 60 * 1000;
+const DEFAULT_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const DEFAULT_REGISTRATION_LIMIT = 20;
+const DEFAULT_PAIRING_CLAIM_LIMIT = 10;
 const CONTROL_ACTIONS = new Set([
   'status',
   'compact',
@@ -91,15 +94,101 @@ function bearerToken(request) {
 
 function sendJson(response, status, payload) {
   const body = JSON.stringify(payload);
+  const corsOrigin = response.codexyCorsOrigin;
   response.writeHead(status, {
     'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-    'Access-Control-Allow-Methods': 'GET, POST, PATCH, OPTIONS',
-    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'DELETE, GET, POST, PATCH, OPTIONS',
+    ...(corsOrigin
+      ? {
+          'Access-Control-Allow-Origin': corsOrigin,
+          Vary: 'Origin',
+        }
+      : {}),
     'Cache-Control': 'no-store',
     'Content-Length': Buffer.byteLength(body),
     'Content-Type': 'application/json; charset=utf-8',
+    'Referrer-Policy': 'no-referrer',
+    'X-Content-Type-Options': 'nosniff',
   });
   response.end(body);
+}
+
+function configuredOrigins(value) {
+  const values = Array.isArray(value)
+    ? value
+    : String(value ?? '')
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+  return new Set(
+    values.flatMap((item) => {
+      try {
+        return [new URL(item).origin];
+      } catch {
+        return [];
+      }
+    }),
+  );
+}
+
+function allowedCorsOrigin(request, allowlist) {
+  const origin = request.headers.origin;
+  if (!origin) return null;
+  let parsed;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return null;
+  }
+  const requestHosts = [
+    request.headers.host,
+    request.headers['x-forwarded-host'],
+  ]
+    .filter((value) => typeof value === 'string')
+    .map((value) => value.toLowerCase());
+  if (requestHosts.includes(parsed.host.toLowerCase())) {
+    return parsed.origin;
+  }
+  return allowlist.has(parsed.origin) ? parsed.origin : null;
+}
+
+function isLocalManagementRequest(request) {
+  const host = request.headers.host;
+  if (typeof host !== 'string' || request.headers.origin) return false;
+  try {
+    const hostname = new URL(`http://${host}`).hostname
+      .replace(/^\[|\]$/g, '')
+      .toLowerCase();
+    return ['127.0.0.1', '::1', 'localhost'].includes(hostname);
+  } catch {
+    return false;
+  }
+}
+
+function rateLimitKey(request) {
+  return `${request.socket.remoteAddress ?? 'unknown'}:${
+    request.headers['user-agent'] ?? 'unknown'
+  }`;
+}
+
+function createAttemptLimiter(options = {}) {
+  const limit = options.limit;
+  const windowMs = options.windowMs;
+  const now = options.now ?? (() => Date.now());
+  const attempts = new Map();
+  return {
+    take(key) {
+      const timestamp = now();
+      const current = attempts.get(key);
+      if (!current || timestamp >= current.resetAt) {
+        attempts.set(key, { count: 1, resetAt: timestamp + windowMs });
+        return true;
+      }
+      if (current.count >= limit) return false;
+      current.count += 1;
+      return true;
+    },
+  };
 }
 
 async function readJson(request) {
@@ -176,7 +265,7 @@ async function sendExpoPush(expoPushToken, event, preferences = {}) {
       },
       body: JSON.stringify({
         to: expoPushToken,
-        channelId: 'agent-events',
+        channelId: 'codex-events',
         title: notification.title,
         body: notification.body,
         data: notification.data,
@@ -187,7 +276,23 @@ async function sendExpoPush(expoPushToken, event, preferences = {}) {
     if (!response.ok) {
       return { status: 'failed', detail: `HTTP ${response.status}` };
     }
-    return { status: 'sent' };
+    const payload = await response.json().catch(() => ({}));
+    const ticket = Array.isArray(payload?.data)
+      ? payload.data[0]
+      : payload?.data;
+    if (ticket?.status === 'error') {
+      const code = text(ticket?.details?.error, '', 80);
+      return {
+        status: code === 'DeviceNotRegistered' ? 'expired' : 'failed',
+        detail: text(ticket?.message, 'Expo rejected the push ticket', 160),
+      };
+    }
+    return {
+      status: 'sent',
+      ...(typeof ticket?.id === 'string'
+        ? { ticket_id: text(ticket.id, '', 128) }
+        : {}),
+    };
   } catch (error) {
     return {
       status: 'failed',
@@ -225,7 +330,7 @@ function normalizeEvent(body) {
     schema_version: '1.0',
     event_id: eventId,
     dedupe_key: dedupeKey,
-    occurred_at: text(body.occurred_at, new Date().toISOString(), 64),
+    occurred_at: normalizedInputTimestamp(body.occurred_at),
     source,
     state,
     event: text(body.event, 'Manual', 80),
@@ -297,7 +402,7 @@ function normalizePromptCapture(body) {
     project_alias: text(body.project_alias, 'Codex project', 64),
     prompt: {
       prompt_id: promptId,
-      captured_at: text(body.captured_at, new Date().toISOString(), 64),
+      captured_at: normalizedInputTimestamp(body.captured_at),
       text: promptText,
     },
   };
@@ -345,15 +450,34 @@ function timestamp(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function normalizedInputTimestamp(value, now = Date.now()) {
+  const parsed = Date.parse(
+    typeof value === 'string' ? value : '',
+  );
+  if (!Number.isFinite(parsed) || parsed > now + 5 * 60 * 1000) {
+    return new Date(now).toISOString();
+  }
+  return new Date(parsed).toISOString();
+}
+
 function pruneAgentSessions(device) {
   const previous = device.agentSessions ?? [];
   const cutoff = Date.now() - PROMPT_RETENTION_MS;
+  let changed = false;
+  for (const session of previous) {
+    const prompts = Array.isArray(session.prompts) ? session.prompts : [];
+    const retained = prompts.filter(
+      (prompt) => timestamp(prompt.captured_at) >= cutoff,
+    );
+    if (retained.length !== prompts.length) changed = true;
+    session.prompts = retained.slice(-MAX_PROMPTS_PER_SESSION);
+  }
   const next = previous
     .filter((session) => timestamp(session.updated_at) >= cutoff)
     .sort((left, right) => timestamp(left.updated_at) - timestamp(right.updated_at))
     .slice(-MAX_AGENT_SESSIONS);
   device.agentSessions = next;
-  return next.length !== previous.length;
+  return changed || next.length !== previous.length;
 }
 
 function getOrCreateAgentSession(device, input) {
@@ -757,6 +881,26 @@ export function createRelayServer(options = {}) {
     options.webPushSender ?? createWebPushSender(vapid);
   const store = loadRelayStore(stateFile);
   const persist = () => persistRelayStore(stateFile, store);
+  const allowedOrigins = configuredOrigins(
+    options.allowedOrigins ?? process.env.CODEXY_ALLOWED_ORIGINS,
+  );
+  const rateLimitOptions = options.rateLimitOptions ?? {};
+  const registrationLimiter = createAttemptLimiter({
+    limit:
+      rateLimitOptions.registrationLimit ??
+      DEFAULT_REGISTRATION_LIMIT,
+    windowMs:
+      rateLimitOptions.windowMs ?? DEFAULT_RATE_LIMIT_WINDOW_MS,
+    now: rateLimitOptions.now,
+  });
+  const pairingClaimLimiter = createAttemptLimiter({
+    limit:
+      rateLimitOptions.pairingClaimLimit ??
+      DEFAULT_PAIRING_CLAIM_LIMIT,
+    windowMs:
+      rateLimitOptions.windowMs ?? DEFAULT_RATE_LIMIT_WINDOW_MS,
+    now: rateLimitOptions.now,
+  });
   const codexControl =
     options.codexControl ?? createCodexControlFromEnvironment();
   const remoteCommands = createRemoteCommandManager({
@@ -810,6 +954,16 @@ export function createRelayServer(options = {}) {
   });
 
   const server = http.createServer(async (request, response) => {
+    const requestOrigin = request.headers.origin;
+    const corsOrigin = allowedCorsOrigin(request, allowedOrigins);
+    response.codexyCorsOrigin = corsOrigin;
+    if (requestOrigin && !corsOrigin) {
+      sendJson(response, 403, {
+        error: 'request origin is not allowed',
+        error_code: 'origin_not_allowed',
+      });
+      return;
+    }
     if (request.method === 'OPTIONS') {
       sendJson(response, 204, {});
       return;
@@ -850,6 +1004,13 @@ export function createRelayServer(options = {}) {
         request.method === 'POST' &&
         segments.join('/') === 'v1/devices/register'
       ) {
+        if (!registrationLimiter.take(rateLimitKey(request))) {
+          throw new HttpError(
+            429,
+            'too many device registration attempts',
+            'registration_rate_limited',
+          );
+        }
         const body = await readJson(request);
         const deviceId = validateDeviceId(body.device_id);
         let device = store.devices.get(deviceId);
@@ -906,6 +1067,20 @@ export function createRelayServer(options = {}) {
         request.method === 'POST' &&
         segments.join('/') === 'v1/pairings/claim'
       ) {
+        if (!isLocalManagementRequest(request)) {
+          throw new HttpError(
+            403,
+            'pairing must be confirmed from localhost',
+            'local_pairing_required',
+          );
+        }
+        if (!pairingClaimLimiter.take(rateLimitKey(request))) {
+          throw new HttpError(
+            429,
+            'too many pairing attempts',
+            'pairing_rate_limited',
+          );
+        }
         const body = await readJson(request);
         const pairingCode = text(body.pairing_code, '', 6);
         const device = [...store.devices.values()].find(
@@ -918,11 +1093,21 @@ export function createRelayServer(options = {}) {
         }
 
         const hookToken = secureToken();
+        for (const candidate of store.devices.values()) {
+          if (
+            candidate.deviceId !== device.deviceId &&
+            candidate.hookToken
+          ) {
+            store.hookTokens.delete(candidate.hookToken);
+            candidate.hookToken = null;
+          }
+        }
         if (device.hookToken) store.hookTokens.delete(device.hookToken);
         device.hookToken = hookToken;
         device.pairingCode = null;
         device.pairingExpiresAt = null;
         store.hookTokens.set(hookToken, device.deviceId);
+        store.activeDeviceId = device.deviceId;
 
         persist();
         sendJson(response, 200, {
@@ -936,6 +1121,23 @@ export function createRelayServer(options = {}) {
       if (segments[0] === 'v1' && segments[1] === 'devices' && segments[2]) {
         const deviceId = validateDeviceId(segments[2]);
         const device = requireDevice(store, deviceId, request);
+
+        if (request.method === 'DELETE' && segments.length === 3) {
+          if (device.hookToken) {
+            store.hookTokens.delete(device.hookToken);
+          }
+          if (store.activeDeviceId === device.deviceId) {
+            store.activeDeviceId = null;
+          }
+          remoteCommands.removeDevice(device.deviceId);
+          store.devices.delete(device.deviceId);
+          persist();
+          sendJson(response, 200, {
+            deleted: true,
+            device_id: device.deviceId,
+          });
+          return;
+        }
 
         if (request.method === 'GET' && segments[3] === 'status') {
           sendJson(response, 200, {
@@ -1319,6 +1521,10 @@ export function createRelayServer(options = {}) {
           device.webPushSubscriptions = (
             device.webPushSubscriptions ?? []
           ).filter((subscription) => !expired.has(subscription.endpoint));
+          persist();
+        }
+        if (expoPushResult.status === 'expired') {
+          device.expoPushToken = null;
           persist();
         }
         sendJson(response, 202, {

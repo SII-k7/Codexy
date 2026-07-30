@@ -73,6 +73,16 @@ function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+function requireActiveCommand(command) {
+  if (command.status === 'canceled' || !command.prompt) {
+    throw new RemoteCommandError(
+      'command_canceled',
+      '这条指令已从手机撤回。',
+      409,
+    );
+  }
+}
+
 function resolveCodexLaunch(command) {
   if (process.platform !== 'win32') {
     return { command, prefix: [], shell: false };
@@ -720,6 +730,7 @@ export class CodexControlBridge {
   }
 
   async dispatch(command, onStatus) {
+    requireActiveCommand(command);
     let thread = await this.threadForSession(command.sessionRef);
     thread = await this.resumeForDirectInput(thread);
     if (!['idle', 'active'].includes(thread.status?.type)) {
@@ -731,6 +742,7 @@ export class CodexControlBridge {
 
     if (command.mode === 'queue') {
       while (thread.status?.type === 'active') {
+        requireActiveCommand(command);
         if (Date.now() >= command.expiresAtMs) {
           throw new RemoteCommandError(
             'command_expired',
@@ -739,6 +751,7 @@ export class CodexControlBridge {
         }
         onStatus?.('waiting', '当前回合仍在工作，指令会在结束后发送。');
         await wait(QUEUE_POLL_MS);
+        requireActiveCommand(command);
         thread = await this.readThread(thread.id, false);
       }
       if (thread.status?.type !== 'idle') {
@@ -747,6 +760,7 @@ export class CodexControlBridge {
           '这个会话当前不能接收新指令。',
         );
       }
+      requireActiveCommand(command);
       onStatus?.('dispatching', '正在开始下一轮 Codex 工作。');
       const result = await this.rpc.request('turn/start', {
         threadId: thread.id,
@@ -766,6 +780,7 @@ export class CodexControlBridge {
       return { turnId: result?.turn?.id ?? null };
     }
 
+    requireActiveCommand(command);
     thread = await this.readThread(thread.id, true);
     const activeTurn = [...(thread.turns ?? [])]
       .reverse()
@@ -776,6 +791,7 @@ export class CodexControlBridge {
         '当前没有可插入的运行中回合，请改用“排队发送”。',
       );
     }
+    requireActiveCommand(command);
     onStatus?.('dispatching', '正在插入当前 Codex 回合。');
     const result = await this.rpc.request('turn/steer', {
       threadId: thread.id,

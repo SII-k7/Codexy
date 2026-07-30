@@ -2,6 +2,7 @@ import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Image,
   KeyboardAvoidingView,
   Platform,
@@ -26,6 +27,7 @@ import {
   RelayError,
   acknowledgeEvent,
   cancelRemotePrompt,
+  deleteDevice,
   getAgentSessions,
   getDeviceStatus,
   getEvents,
@@ -40,14 +42,16 @@ import {
   updateSessionControl,
 } from './src/relay';
 import {
-  clearSavedDevice,
+  clearAllCodexyStorage,
   loadSavedDevice,
   saveDevice,
 } from './src/storage';
 import {
   DEFAULT_WEB_PUSH_STATUS,
+  disableWebPush,
   enableWebPush,
   getWebPushStatus,
+  syncWebPush,
 } from './src/webPush';
 import type { WebPushStatus } from './src/webPushTypes';
 import type {
@@ -443,7 +447,14 @@ export default function App() {
   useEffect(() => {
     if (booting) return;
     let active = true;
-    void getWebPushStatus().then((status) => {
+    const statusPromise = savedDevice
+      ? syncWebPush({
+          relayUrl: savedDevice.relayUrl,
+          deviceId: savedDevice.deviceId,
+          deviceSecret: savedDevice.deviceSecret,
+        })
+      : getWebPushStatus();
+    void statusPromise.then((status) => {
       if (active) setWebPushStatus(status);
     });
     return () => {
@@ -569,7 +580,30 @@ export default function App() {
   }, [relayInput, savedDevice]);
 
   const resetConnection = useCallback(async () => {
-    await clearSavedDevice();
+    if (!previewMode && savedDevice) {
+      setConnecting(true);
+      setConnectionError(null);
+      try {
+        await deleteDevice({
+          relayUrl: savedDevice.relayUrl,
+          deviceId: savedDevice.deviceId,
+          deviceSecret: savedDevice.deviceSecret,
+        });
+      } catch (error) {
+        if (!(error instanceof RelayError && error.status === 404)) {
+          setConnectionError(
+            error instanceof Error
+              ? `无法从电脑撤销设备：${error.message}`
+              : '无法从电脑撤销设备；当前连接已保留。',
+          );
+          setConnecting(false);
+          return;
+        }
+      }
+      await disableWebPush();
+      setConnecting(false);
+    }
+    await clearAllCodexyStorage();
     setSavedDevice(null);
     setPreviewMode(false);
     setPaired(false);
@@ -588,7 +622,26 @@ export default function App() {
     previewControlsRef.current.clear();
     cursorRef.current = 0;
     setCursor(0);
-  }, []);
+  }, [previewMode, savedDevice]);
+
+  const confirmResetConnection = useCallback(() => {
+    if (previewMode) {
+      void resetConnection();
+      return;
+    }
+    Alert.alert(
+      '撤销这台手机？',
+      '电脑端设备凭据、后台推送订阅和本机草稿都会删除。之后需要重新配对。',
+      [
+        { text: '取消', style: 'cancel' },
+        {
+          text: '撤销并断开',
+          style: 'destructive',
+          onPress: () => void resetConnection(),
+        },
+      ],
+    );
+  }, [previewMode, resetConnection]);
 
   const saveNotificationPreferences = useCallback(
     async (patch: Partial<DevicePreferences>) => {
@@ -1809,11 +1862,16 @@ export default function App() {
 
             <Pressable
               accessibilityRole="button"
-              onPress={() => void resetConnection()}
+              disabled={connecting}
+              onPress={confirmResetConnection}
               style={styles.resetButton}
             >
               <Text style={styles.resetButtonText}>
-                {previewMode ? '退出体验模式' : '断开这台设备'}
+                {previewMode
+                  ? '退出体验模式'
+                  : connecting
+                    ? '正在撤销…'
+                    : '撤销并断开这台设备'}
               </Text>
             </Pressable>
           </>

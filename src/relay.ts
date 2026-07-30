@@ -91,6 +91,20 @@ export async function registerDevice(input: {
   );
 }
 
+export async function deleteDevice(input: {
+  relayUrl: string;
+  deviceId: string;
+  deviceSecret: string;
+}): Promise<void> {
+  await requestJson(
+    `${normalizeRelayUrl(input.relayUrl)}/v1/devices/${encodeURIComponent(input.deviceId)}`,
+    {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${input.deviceSecret}` },
+    },
+  );
+}
+
 export async function getDeviceStatus(
   relayUrl: string,
   deviceId: string,

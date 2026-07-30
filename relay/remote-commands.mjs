@@ -56,6 +56,7 @@ export function createRemoteCommandManager(options = {}) {
   const commands = new Map();
   const commandsByDevice = new Map();
   const idempotency = new Map();
+  const sessionTails = new Map();
   let closed = false;
 
   function prune() {
@@ -131,6 +132,22 @@ export function createRemoteCommandManager(options = {}) {
     }
   }
 
+  function scheduleCommand(command) {
+    const sessionKey = `${command.deviceId}:${command.sessionRef}`;
+    const previous = sessionTails.get(sessionKey) ?? Promise.resolve();
+    const scheduled = previous
+      .catch(() => {
+        // A failed command must not block later commands for this session.
+      })
+      .then(() => processCommand(command))
+      .finally(() => {
+        if (sessionTails.get(sessionKey) === scheduled) {
+          sessionTails.delete(sessionKey);
+        }
+      });
+    sessionTails.set(sessionKey, scheduled);
+  }
+
   function enqueue(input) {
     if (closed) {
       throw new RemoteCommandError(
@@ -186,7 +203,7 @@ export function createRemoteCommandManager(options = {}) {
       [...deviceCommands, command.commandId].slice(-MAX_COMMANDS_PER_DEVICE),
     );
     idempotency.set(idempotencyKey, command.commandId);
-    queueMicrotask(() => void processCommand(command));
+    scheduleCommand(command);
     return publicCommand(command);
   }
 
@@ -211,11 +228,32 @@ export function createRemoteCommandManager(options = {}) {
   function cancel(deviceId, commandId) {
     const command = commands.get(commandId);
     if (!command || command.deviceId !== deviceId) return null;
-    if (!FINAL_STATUSES.has(command.status)) {
+    if (['queued', 'waiting'].includes(command.status)) {
       setStatus(command, 'canceled', '已在送达 Codex 前取消。');
       command.prompt = '';
+    } else if (!FINAL_STATUSES.has(command.status)) {
+      throw new RemoteCommandError(
+        'command_already_dispatching',
+        '这条指令已经开始交给 Codex，不能再保证撤回。',
+        409,
+      );
     }
     return publicCommand(command);
+  }
+
+  function removeDevice(deviceId) {
+    const commandIds = commandsByDevice.get(deviceId) ?? [];
+    for (const commandId of commandIds) {
+      const command = commands.get(commandId);
+      if (!command) continue;
+      if (!FINAL_STATUSES.has(command.status)) {
+        setStatus(command, 'canceled', '配对设备已被撤销。');
+      }
+      command.prompt = '';
+      commands.delete(commandId);
+      idempotency.delete(`${deviceId}:${command.idempotencyKey}`);
+    }
+    commandsByDevice.delete(deviceId);
   }
 
   function close() {
@@ -226,7 +264,8 @@ export function createRemoteCommandManager(options = {}) {
       }
       command.prompt = '';
     }
+    sessionTails.clear();
   }
 
-  return { cancel, close, enqueue, get, list };
+  return { cancel, close, enqueue, get, list, removeDevice };
 }

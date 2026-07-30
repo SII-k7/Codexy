@@ -3,20 +3,49 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = [System.IO.Path]::GetFullPath(
   (Join-Path $PSScriptRoot '..')
 )
+$envFile = Join-Path $projectRoot '.env.local'
+$logDirectory = Join-Path $env:USERPROFILE '.codex\codexy'
+$logPath = Join-Path $logDirectory 'relay.log'
+$previousLogPath = Join-Path $logDirectory 'relay.log.1'
+New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+if (
+  (Test-Path -LiteralPath $logPath -PathType Leaf) -and
+  (Get-Item -LiteralPath $logPath).Length -gt 5MB
+) {
+  Move-Item `
+    -LiteralPath $logPath `
+    -Destination $previousLogPath `
+    -Force
+}
+trap {
+  $detail = ($_ | Out-String).Trim()
+  Add-Content `
+    -LiteralPath $logPath `
+    -Value "[$([DateTime]::UtcNow.ToString('o'))] startup_failed: $detail"
+  exit 1
+}
+
+if (-not (Test-Path -LiteralPath $envFile)) {
+  throw 'Missing .env.local. Run npm run private:configure first.'
+}
+$nodeCommandLine = Get-Content -LiteralPath $envFile |
+  Where-Object { $_ -match '^CODEXY_NODE_COMMAND=' } |
+  Select-Object -Last 1
+$configuredNode = if ($nodeCommandLine) {
+  (($nodeCommandLine -split '=', 2)[1].Trim() -replace '^"(.*)"$', '$1')
+} else {
+  $null
+}
 $nodeCandidates = @(
-  (Get-Command node.exe -ErrorAction SilentlyContinue).Source,
-  'E:\vibe coding\node.exe'
+  $configuredNode,
+  (Get-Command node.exe -ErrorAction SilentlyContinue).Source
 ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
 
 if (-not $nodeCandidates) {
   throw 'Node.js was not found. Install Node.js or update start-private-pwa.ps1.'
 }
 
-$envFile = Join-Path $projectRoot '.env.local'
 $serverFile = Join-Path $projectRoot 'relay\server.mjs'
-if (-not (Test-Path -LiteralPath $envFile)) {
-  throw 'Missing .env.local. Run npm run private:configure first.'
-}
 $webRootLine = Get-Content -LiteralPath $envFile |
   Where-Object { $_ -match '^CODEXY_WEB_ROOT=' } |
   Select-Object -Last 1
@@ -34,4 +63,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $webRootPath 'index.html'))) {
 }
 
 Set-Location -LiteralPath $projectRoot
-& $nodeCandidates[0] "--env-file-if-exists=$envFile" $serverFile --host 127.0.0.1
+& $nodeCandidates[0] `
+  "--env-file-if-exists=$envFile" `
+  $serverFile `
+  --host 127.0.0.1 `
+  >> $logPath 2>&1
+exit $LASTEXITCODE

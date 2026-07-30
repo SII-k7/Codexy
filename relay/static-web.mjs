@@ -35,6 +35,8 @@ function cacheControl(pathname, filePath) {
 function staticHeaders(pathname, filePath, length) {
   return {
     'Cache-Control': cacheControl(pathname, filePath),
+    'Content-Security-Policy':
+      "default-src 'self'; base-uri 'none'; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*; font-src 'self' data:; form-action 'none'; frame-ancestors 'none'; img-src 'self' data: blob:; manifest-src 'self'; object-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; worker-src 'self'",
     'Content-Length': length,
     'Content-Type':
       CONTENT_TYPES.get(extname(filePath).toLowerCase()) ??
@@ -43,6 +45,7 @@ function staticHeaders(pathname, filePath, length) {
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
     'Referrer-Policy': 'no-referrer',
     'Service-Worker-Allowed': '/',
+    'Strict-Transport-Security': 'max-age=31536000',
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
   };
