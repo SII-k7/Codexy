@@ -85,6 +85,47 @@ test('reports the isolated Codexy Relay identity', async () => {
   assert.equal(health.body.service, 'codexy-relay');
 });
 
+test('authenticated change feed wakes on lifecycle updates and revocation, without carrying content', async () => {
+  const { deviceSecret, hookToken } = await registerAndPair();
+  const path = '/v1/devices/device-test-123/changes';
+  assert.equal((await json(path)).status, 401);
+  const headers = { Authorization: `Bearer ${deviceSecret}` };
+  const first = await json(path, { headers });
+  assert.equal(first.body.changed, true);
+  let settled = false;
+  const pending = json(`${path}?after=${first.body.revision}`, { headers }).then((result) => { settled = true; return result; });
+  await new Promise((resolve) => setTimeout(resolve, 20)); assert.equal(settled, false);
+  await json('/v1/events', { method: 'POST', headers: { Authorization: `Bearer ${hookToken}` }, body: JSON.stringify({
+    event_id: 'live-event', dedupe_key: 'live-event', occurred_at: new Date().toISOString(), source: 'codex', state: 'working', event: 'UserPromptSubmit', project_alias: 'Test', summary: 'Working', session_ref: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaa',
+  }) });
+  const update = await pending;
+  assert.deepEqual(Object.keys(update.body).sort(), ['changed', 'revision']);
+  assert.notEqual(update.body.revision, first.body.revision);
+  const revoked = json(`${path}?after=${update.body.revision}`, { headers });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await json('/v1/devices/device-test-123', { method: 'DELETE', headers });
+  assert.equal((await revoked).status, 401);
+});
+
+test('snapshot is authenticated, isolates phones and retains long-running sessions while expiring prompts', async () => {
+  const { deviceSecret } = await registerAndPair();
+  const device = relayStore.devices.get('device-test-123');
+  device.agentSessions.push({ session_ref: 'sha256:1111222233334444', source: 'codex', project_alias: 'long-job', state: 'working', summary: 'busy', updated_at: '2020-01-01T00:00:00Z', prompts: [{ prompt_id: 'old', captured_at: '2020-01-01T00:00:00Z', text: 'expired input' }] });
+  const rejected = await json('/v1/devices/device-test-123/snapshot');
+  assert.equal(rejected.status, 401);
+  const response = await json('/v1/devices/device-test-123/snapshot', { headers: { Authorization: `Bearer ${deviceSecret}` } });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.sessions.length, 1);
+  assert.deepEqual(response.body.sessions[0].prompts, []);
+  assert.equal(response.body.status.paired, true);
+  assert.equal(response.body.next_cursor, device.nextCursor);
+  assert.equal(JSON.stringify(response.body).includes(deviceSecret), false);
+  assert.equal(JSON.stringify(response.body).includes('expired input'), false);
+  const other = await json('/v1/devices/register', { method: 'POST', body: JSON.stringify({ device_id: 'other-phone', platform: 'test' }) });
+  const isolated = await json('/v1/devices/other-phone/snapshot', { headers: { Authorization: `Bearer ${other.body.device_secret}` } });
+  assert.deepEqual(isolated.body.sessions, []);
+});
+
 test('rejects untrusted browser origins and reflects the same origin only', async () => {
   const rejected = await json('/health', {
     headers: { Origin: 'https://evil.example' },
@@ -107,6 +148,7 @@ test('rate limits device registration and pairing attempts', async () => {
     pushSender: async () => ({ status: 'test_skipped' }),
     rateLimitOptions: {
       pairingClaimLimit: 1,
+      pairingCodeRenewalLimit: 1,
       registrationLimit: 1,
       windowMs: 60_000,
     },
@@ -123,6 +165,32 @@ test('rate limits device registration and pairing attempts', async () => {
     }),
   });
   assert.equal(first.status, 200);
+  const firstRenewal = await json(
+    '/v1/devices/device-limited-1/pairing-code',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${first.body.device_secret}`,
+      },
+      body: JSON.stringify({}),
+    },
+  );
+  assert.equal(firstRenewal.status, 200);
+  const limitedRenewal = await json(
+    '/v1/devices/device-limited-1/pairing-code',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${first.body.device_secret}`,
+      },
+      body: JSON.stringify({}),
+    },
+  );
+  assert.equal(limitedRenewal.status, 429);
+  assert.equal(
+    limitedRenewal.body.error_code,
+    'pairing_code_rate_limited',
+  );
   const second = await json('/v1/devices/register', {
     method: 'POST',
     body: JSON.stringify({
@@ -144,6 +212,66 @@ test('rate limits device registration and pairing attempts', async () => {
   });
   assert.equal(limitedClaim.status, 429);
   assert.equal(limitedClaim.body.error_code, 'pairing_rate_limited');
+});
+
+test('renews pairing codes only for the authenticated unpaired device', async () => {
+  const registration = await json('/v1/devices/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      device_id: 'device-renew-123',
+      platform: 'test',
+    }),
+  });
+  assert.equal(registration.status, 200);
+  const originalCode = registration.body.pairing_code;
+  relayStore.devices.get('device-renew-123').pairingExpiresAt = Date.now() - 1;
+
+  const unauthorized = await json(
+    '/v1/devices/device-renew-123/pairing-code',
+    {
+      method: 'POST',
+      body: JSON.stringify({}),
+    },
+  );
+  assert.equal(unauthorized.status, 401);
+
+  const renewed = await json('/v1/devices/device-renew-123/pairing-code', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${registration.body.device_secret}`,
+    },
+    body: JSON.stringify({}),
+  });
+  assert.equal(renewed.status, 200);
+  assert.equal(renewed.body.device_id, 'device-renew-123');
+  assert.equal(renewed.body.paired, false);
+  assert.match(renewed.body.pairing_code, /^\d{6}$/);
+  assert.notEqual(renewed.body.pairing_code, originalCode);
+  assert.ok(Date.parse(renewed.body.pairing_expires_at) > Date.now());
+
+  const oldCode = await json('/v1/pairings/claim', {
+    method: 'POST',
+    body: JSON.stringify({ pairing_code: originalCode }),
+  });
+  assert.equal(oldCode.status, 404);
+  const paired = await json('/v1/pairings/claim', {
+    method: 'POST',
+    body: JSON.stringify({ pairing_code: renewed.body.pairing_code }),
+  });
+  assert.equal(paired.status, 200);
+
+  const alreadyPaired = await json(
+    '/v1/devices/device-renew-123/pairing-code',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${registration.body.device_secret}`,
+      },
+      body: JSON.stringify({}),
+    },
+  );
+  assert.equal(alreadyPaired.status, 409);
+  assert.equal(alreadyPaired.body.error_code, 'device_already_paired');
 });
 
 test('activating a new phone revokes the previous hook token', async () => {
@@ -259,6 +387,178 @@ test('returns and updates authenticated device notification preferences', async 
     body: JSON.stringify({ notification_level: 'everything' }),
   });
   assert.equal(invalid.status, 400);
+});
+
+test('sends only fixed privacy-safe authenticated test notifications', async () => {
+  await new Promise((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+  const vapid = webpush.generateVAPIDKeys();
+  const expoDeliveries = [];
+  const webDeliveries = [];
+  const created = createRelayServer({
+    pushSender: async (token, event, preferences) => {
+      expoDeliveries.push({ token, event, preferences });
+      return token ? { status: 'sent' } : { status: 'not_configured' };
+    },
+    webPushSender: async (subscriptions, event, preferences) => {
+      webDeliveries.push({ subscriptions, event, preferences });
+      return subscriptions.length
+        ? { status: 'sent', sent: subscriptions.length, expiredEndpoints: [] }
+        : { status: 'not_subscribed', sent: 0, expiredEndpoints: [] };
+    },
+    vapid: {
+      subject: 'mailto:self@example.test',
+      publicKey: vapid.publicKey,
+      privateKey: vapid.privateKey,
+    },
+    rateLimitOptions: {
+      testNotificationLimit: 1,
+      windowMs: 60_000,
+    },
+  });
+  server = created.server;
+  relayStore = created.store;
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const registration = await json('/v1/devices/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      device_id: 'device-test-push-123',
+      platform: 'test',
+      expo_push_token: 'ExponentPushToken[test-notification]',
+    }),
+  });
+  assert.equal(registration.status, 200);
+  const authorization = {
+    Authorization: `Bearer ${registration.body.device_secret}`,
+  };
+  const subscription = await json(
+    '/v1/devices/device-test-push-123/web-push-subscriptions',
+    {
+      method: 'POST',
+      headers: authorization,
+      body: JSON.stringify({
+        endpoint: 'https://push.example.test/test-notification',
+        keys: { p256dh: 'test-p256dh', auth: 'test-auth' },
+      }),
+    },
+  );
+  assert.equal(subscription.status, 200);
+
+  const unauthorized = await json(
+    '/v1/devices/device-test-push-123/test-notification',
+    { method: 'POST', body: JSON.stringify({}) },
+  );
+  assert.equal(unauthorized.status, 401);
+
+  const contentRejected = await json(
+    '/v1/devices/device-test-push-123/test-notification',
+    {
+      method: 'POST',
+      headers: authorization,
+      body: JSON.stringify({
+        prompt: 'SECRET PROMPT',
+        path: 'C:\\private\\project',
+        code: 'console.log("SECRET CODE")',
+      }),
+    },
+  );
+  assert.equal(contentRejected.status, 400);
+  assert.equal(
+    contentRejected.body.error_code,
+    'test_notification_content_not_allowed',
+  );
+  assert.equal(expoDeliveries.length, 0);
+  assert.equal(webDeliveries.length, 0);
+
+  const delivered = await json(
+    '/v1/devices/device-test-push-123/test-notification',
+    {
+      method: 'POST',
+      headers: authorization,
+      body: JSON.stringify({}),
+    },
+  );
+  assert.equal(delivered.status, 200);
+  assert.deepEqual(delivered.body, {
+    delivered: true,
+    delivery_status: 'sent',
+    push_channels: { expo: 'sent', web: 'sent' },
+    content_source: 'fixed',
+    persisted: false,
+  });
+  assert.equal(expoDeliveries.length, 1);
+  assert.equal(webDeliveries.length, 1);
+  assert.deepEqual(expoDeliveries[0].event, webDeliveries[0].event);
+  assert.deepEqual(Object.keys(expoDeliveries[0].event).sort(), [
+    'event',
+    'event_id',
+    'project_alias',
+    'schema_version',
+    'source',
+    'state',
+    'summary',
+  ]);
+  const notificationPayload = webPushPayloadForEvent(
+    expoDeliveries[0].event,
+    expoDeliveries[0].preferences,
+  );
+  assert.equal(notificationPayload.data.session_ref, null);
+  assert.equal(notificationPayload.data.deepLink, 'codexy://');
+  assert.equal(notificationPayload.data.url, '/');
+  const deliveredPayload = JSON.stringify({
+    event: expoDeliveries[0].event,
+    notification: notificationPayload,
+    response: delivered.body,
+  });
+  assert.doesNotMatch(deliveredPayload, /SECRET PROMPT/);
+  assert.doesNotMatch(deliveredPayload, /private\\project/);
+  assert.doesNotMatch(deliveredPayload, /SECRET CODE/);
+  assert.equal(
+    relayStore.devices.get('device-test-push-123').events.length,
+    0,
+  );
+
+  const rateLimited = await json(
+    '/v1/devices/device-test-push-123/test-notification',
+    {
+      method: 'POST',
+      headers: authorization,
+      body: JSON.stringify({}),
+    },
+  );
+  assert.equal(rateLimited.status, 429);
+  assert.equal(
+    rateLimited.body.error_code,
+    'test_notification_rate_limited',
+  );
+
+  const noPushRegistration = await json('/v1/devices/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      device_id: 'device-no-push-123',
+      platform: 'test',
+    }),
+  });
+  const noPush = await json(
+    '/v1/devices/device-no-push-123/test-notification',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${noPushRegistration.body.device_secret}`,
+      },
+      body: JSON.stringify({}),
+    },
+  );
+  assert.equal(noPush.status, 200);
+  assert.equal(noPush.body.delivered, false);
+  assert.equal(noPush.body.delivery_status, 'not_configured');
+  assert.deepEqual(noPush.body.push_channels, {
+    expo: 'not_configured',
+    web: 'not_subscribed',
+  });
 });
 
 test('filters lifecycle pushes by level and passes one tone to both channels', async () => {

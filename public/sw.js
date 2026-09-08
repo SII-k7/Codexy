@@ -1,7 +1,8 @@
-const CACHE_VERSION = 'codexy-shell-v1';
+const CACHE_VERSION = 'codexy-shell-v3';
 const CORE_ASSETS = [
   '/',
   '/manifest.json',
+  '/apple-touch-icon-180.png',
   '/icon-192.png',
   '/icon-512.png',
 ];
@@ -58,7 +59,7 @@ self.addEventListener('fetch', (event) => {
   const request = event.request;
   if (request.method !== 'GET') return;
   const url = new URL(request.url);
-  if (url.origin !== self.location.origin || url.pathname.startsWith('/v1/')) {
+  if (url.origin !== self.location.origin || url.pathname.startsWith('/v1/') || url.pathname.startsWith('/h/')) {
     return;
   }
   if (request.mode === 'navigate') {
@@ -97,7 +98,7 @@ self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   const notificationData = event.notification.data ?? {};
   const destinationPath = notificationData.session_ref
-    ? `/?session=${encodeURIComponent(notificationData.session_ref)}`
+    ? `/?session=${encodeURIComponent(notificationData.session_ref)}${notificationData.device_ref ? `&device=${encodeURIComponent(notificationData.device_ref)}` : ''}`
     : notificationData.url || '/';
   const destination = new URL(destinationPath, self.location.origin).href;
   event.waitUntil(

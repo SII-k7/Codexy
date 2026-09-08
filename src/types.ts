@@ -31,6 +31,11 @@ export interface AgentPrompt {
 }
 
 export interface AgentSession {
+  status_source?: 'lifecycle' | 'app_server';
+  activity_confirmed?: boolean;
+  observed_at?: string;
+  host_label?: string;
+  storage_scope?: string;
   session_ref: string;
   source: 'codex';
   project_alias: string;
@@ -56,6 +61,36 @@ export interface DeviceRegistration {
   pairing_code: string | null;
   pairing_expires_at: string | null;
   paired: boolean;
+}
+
+export interface PairingCodeRenewal {
+  device_id: string;
+  pairing_code: string;
+  pairing_expires_at: string;
+  paired: false;
+}
+
+export type PushDeliveryStatus =
+  | 'sent'
+  | 'not_configured'
+  | 'not_subscribed'
+  | 'expired'
+  | 'failed';
+
+export interface TestNotificationResult {
+  delivered: boolean;
+  delivery_status:
+    | 'sent'
+    | 'partial'
+    | 'not_configured'
+    | 'expired'
+    | 'failed';
+  push_channels: {
+    expo: PushDeliveryStatus;
+    web: PushDeliveryStatus;
+  };
+  content_source: 'fixed';
+  persisted: false;
 }
 
 export interface DeviceStatus {
@@ -168,6 +203,7 @@ export type RemotePromptStatus =
   | 'sent'
   | 'failed'
   | 'canceled'
+  | 'unknown'
   | 'expired';
 
 export interface RemotePromptCommand {
@@ -185,7 +221,41 @@ export interface RemotePromptCommand {
 }
 
 export interface SavedDevice {
+  label?: string;
   deviceId: string;
   deviceSecret: string;
   relayUrl: string;
+}
+
+export interface RelaySnapshot {
+  hub_online?: boolean;
+  hub_seen_at?: string | null;
+  status: DeviceStatus;
+  sessions: AgentSession[];
+  commands: RemotePromptCommand[];
+  events: AgentEvent[];
+  next_cursor: number;
+  generated_at: string;
+}
+
+export interface CodexGoal {
+  objective: string;
+  status: 'active' | 'paused' | 'blocked' | 'usageLimited' | 'budgetLimited' | 'complete';
+  token_budget: number | null;
+  tokens_used: number | null;
+  time_used_seconds: number | null;
+}
+export interface CodexGoalInput {
+  action: 'set' | 'pause' | 'resume';
+  objective?: string;
+  token_budget?: number;
+  idempotency_key: string;
+}
+export interface CodexSessionRuntime {
+  session_ref: string;
+  context: { used_tokens: number; window_tokens: number; used_percent: number; estimated: boolean; observed_at: string } | null;
+  weekly: { remaining_percent: number; resets_at: string | null } | null;
+  goal_available: boolean;
+  goal: CodexGoal | null;
+  refreshed_at: string;
 }

@@ -24,6 +24,10 @@ function isIos(): boolean {
   return /iPhone|iPad|iPod/i.test(navigator.userAgent);
 }
 
+export function requiresStandaloneInstall(): boolean {
+  return isIos() && !isInstalledWebApp();
+}
+
 function permissionStatus(): NotificationPermission {
   return Notification.permission;
 }
@@ -49,8 +53,15 @@ function errorStatus(detail: string): WebPushStatus {
   };
 }
 
-async function existingSubscription(): Promise<PushSubscription | null> {
-  const registration = await navigator.serviceWorker.getRegistration();
+type PushScope = { relayUrl: string; deviceId: string };
+export function pushScope(input?: PushScope): string {
+  return input ? `/codexy-push/${encodeURIComponent(`${normalizeRelayUrl(input.relayUrl)}|${input.deviceId}`)}/` : '/';
+}
+
+async function existingSubscription(input?: PushScope): Promise<PushSubscription | null> {
+  const scope = pushScope(input);
+  const registration = await navigator.serviceWorker.getRegistration(scope);
+  if (registration?.scope && new URL(registration.scope).pathname !== scope) return null;
   return registration?.pushManager.getSubscription() ?? null;
 }
 
@@ -118,16 +129,30 @@ async function synchronizeSubscription(
     deviceSecret: string;
   },
   createIfMissing: boolean,
+  replaceExisting = false,
 ): Promise<WebPushStatus> {
   const publicKey = await publicKeyForRelay(input.relayUrl);
   const expectedKey = base64UrlToUint8Array(publicKey);
-  const registration =
-    (await navigator.serviceWorker.getRegistration()) ??
-    (await navigator.serviceWorker.register('/sw.js', { scope: '/' }));
-  await navigator.serviceWorker.ready;
+  // A PushSubscription is bound to one VAPID key. Separate registrations
+  // prevent selecting computer B from replacing computer A's subscription.
+  const registration = await navigator.serviceWorker.register('/sw.js', { scope: pushScope(input) });
+  if (!registration.active && (registration.installing || registration.waiting)) {
+    await new Promise<void>((resolve, reject) => {
+      const worker = registration.installing || registration.waiting;
+      const timer = setTimeout(() => { worker?.removeEventListener('statechange', changed); reject(new Error('通知服务尚未就绪，请稍后重试。')); }, 5000);
+      const changed = () => { if (worker?.state === 'activated') { clearTimeout(timer); worker.removeEventListener('statechange', changed); resolve(); } };
+      worker?.addEventListener('statechange', changed); changed();
+    });
+  }
   let subscription = await registration.pushManager.getSubscription();
-  if (subscription && !subscriptionUsesKey(subscription, expectedKey)) {
-    await subscription.unsubscribe();
+  if (
+    subscription &&
+    (replaceExisting || !subscriptionUsesKey(subscription, expectedKey))
+  ) {
+    const removed = await subscription.unsubscribe();
+    if (!removed && (await registration.pushManager.getSubscription())) {
+      throw new Error('旧的系统通知订阅暂时无法更新，请完全关闭 Codexy 后重试。');
+    }
     subscription = null;
   }
   if (!subscription && createIfMissing) {
@@ -153,7 +178,7 @@ export const DEFAULT_WEB_PUSH_STATUS: WebPushStatus = {
   canEnable: true,
 };
 
-export async function getWebPushStatus(): Promise<WebPushStatus> {
+export async function getWebPushStatus(input?: PushScope): Promise<WebPushStatus> {
   if (
     !('serviceWorker' in navigator) ||
     !('PushManager' in window) ||
@@ -169,7 +194,7 @@ export async function getWebPushStatus(): Promise<WebPushStatus> {
       canEnable: false,
     };
   }
-  if (isIos() && !isInstalledWebApp()) {
+  if (requiresStandaloneInstall()) {
     return {
       phase: 'install-required',
       label: '先添加到主屏幕',
@@ -187,7 +212,7 @@ export async function getWebPushStatus(): Promise<WebPushStatus> {
     };
   }
   try {
-    if (await existingSubscription()) {
+    if (await existingSubscription(input)) {
       return {
         phase: 'subscribed',
         label: '浏览器已允许通知',
@@ -206,7 +231,7 @@ export async function syncWebPush(input: {
   deviceId: string;
   deviceSecret: string;
 }): Promise<WebPushStatus> {
-  const status = await getWebPushStatus();
+  const status = await getWebPushStatus(input);
   if (
     ['unsupported', 'insecure', 'install-required', 'denied'].includes(
       status.phase,
@@ -236,10 +261,10 @@ export async function enableWebPush(input: {
     !('PushManager' in window) ||
     !('Notification' in window) ||
     !window.isSecureContext ||
-    (isIos() && !isInstalledWebApp()) ||
+    requiresStandaloneInstall() ||
     permissionStatus() === 'denied'
   ) {
-    return getWebPushStatus();
+    return getWebPushStatus(input);
   }
 
   try {
@@ -258,7 +283,7 @@ export async function enableWebPush(input: {
         : errorStatus('你暂时没有允许通知，可以需要时再开启。');
     }
 
-    return await synchronizeSubscription(input, true);
+    return await synchronizeSubscription(input, true, true);
   } catch (error) {
     const message =
       error instanceof Error && error.name === 'NotAllowedError'
@@ -268,12 +293,22 @@ export async function enableWebPush(input: {
   }
 }
 
-export async function disableWebPush(): Promise<void> {
+export async function disableWebPush(input?: PushScope): Promise<void> {
   if (!('serviceWorker' in navigator)) return;
   try {
-    const subscription = await existingSubscription();
+    const subscription = await existingSubscription(input);
     await subscription?.unsubscribe();
   } catch {
     // Device deletion on the Relay is authoritative; local cleanup is best effort.
   }
+}
+
+export async function resetExpiredWebPush(input?: PushScope): Promise<WebPushStatus> {
+  await disableWebPush(input);
+  return {
+    phase: 'expired',
+    label: '通知需要更新',
+    detail: '旧的系统订阅已经失效，请点击下方重新启用后台通知。',
+    canEnable: true,
+  };
 }

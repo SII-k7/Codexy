@@ -6,6 +6,60 @@ import {
   createRemoteCommandManager,
 } from './remote-commands.mjs';
 
+test('Steer bypasses a Queue waiting for the active turn', async () => {
+  const gate = deferred(); const started = [];
+  const manager = createRemoteCommandManager({ dispatch: async (command, setStatus) => {
+    started.push(command.mode);
+    if (command.mode === 'queue') { setStatus('waiting', 'waiting'); await gate.promise; }
+    return { turnId: 'active' };
+  } });
+  manager.enqueue(input('queue-command'));
+  const steer = manager.enqueue({ ...input('steer-command'), mode: 'steer' });
+  await nextTurn();
+  assert.deepEqual(started, ['queue', 'steer']);
+  assert.equal(manager.get('device-test', steer.command_id).status, 'sent');
+  gate.resolve(); await nextTurn(); manager.close();
+});
+
+test('different phones serialize Queue commands for the same desktop session', async () => {
+  const gate = deferred(); const started = [];
+  const manager = createRemoteCommandManager({ dispatch: async (command) => { started.push(command.deviceId); if (started.length === 1) await gate.promise; } });
+  manager.enqueue(input('one-command'));
+  manager.enqueue({ ...input('two-command'), deviceId: 'other-phone' });
+  await nextTurn(); assert.deepEqual(started, ['device-test']);
+  gate.resolve(); await nextTurn(); assert.deepEqual(started, ['device-test', 'other-phone']); manager.close();
+});
+
+test('idempotency replays a receipt and rejects changed content or target', async () => {
+  const manager = createRemoteCommandManager({ dispatch: async () => ({ turnId: 'one' }) });
+  const first = manager.enqueue(input('same-key')); await nextTurn();
+  assert.equal(manager.enqueue(input('same-key')).command_id, first.command_id);
+  assert.throws(() => manager.enqueue(input('same-key', 'different')), { code: 'idempotency_conflict' });
+  assert.throws(() => manager.findExisting({ ...input('same-key'), sessionRef: 'another' }), { code: 'idempotency_conflict' });
+  manager.close();
+});
+
+test('receipt arriving after TTL remains sent and uncertain transport is not labeled failed', async () => {
+  let clock = 0; const gate = deferred();
+  const manager = createRemoteCommandManager({ now: () => clock, ttlMs: 100,
+    dispatch: async (command) => { if (command.prompt === 'unknown') throw new RemoteCommandError('delivery_unknown', 'check session'); await gate.promise; return { turnId: 'accepted' }; } });
+  const command = manager.enqueue(input('slow-ack')); await nextTurn(); clock = 101;
+  gate.resolve(); await nextTurn();
+  assert.equal(manager.get('device-test', command.command_id).status, 'sent');
+  const unknown = manager.enqueue(input('unknown-key', 'unknown')); await nextTurn();
+  assert.equal(manager.get('device-test', unknown.command_id).status, 'unknown'); manager.close();
+});
+
+test('waiting and queued prompts expire even when an earlier dispatch is blocked', async () => {
+  let clock = 0; const gate = deferred(); let observed;
+  const manager = createRemoteCommandManager({ now: () => clock, ttlMs: 100, dispatch: async (command, setStatus) => { observed = command; setStatus('waiting', 'busy'); await gate.promise; } });
+  manager.enqueue(input('first-expire')); const second = manager.enqueue(input('second-expire'));
+  await nextTurn(); clock = 101; manager.list('device-test');
+  assert.equal(observed.prompt, ''); assert.equal(observed.status, 'expired');
+  assert.equal(manager.get('device-test', second.command_id).status, 'expired');
+  gate.resolve(); await nextTurn(); manager.close();
+});
+
 function deferred() {
   let resolve;
   const promise = new Promise((done) => {

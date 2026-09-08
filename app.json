@@ -19,7 +19,7 @@
       "package": "app.codexy.mobile",
       "versionCode": 1,
       "adaptiveIcon": {
-        "backgroundColor": "#111111",
+        "backgroundColor": "#FFFFFF",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },

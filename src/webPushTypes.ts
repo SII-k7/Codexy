@@ -5,6 +5,7 @@ export type WebPushPhase =
   | 'install-required'
   | 'ready'
   | 'subscribed'
+  | 'expired'
   | 'denied'
   | 'error';
 

@@ -8,7 +8,9 @@ const relayUrl = (
   .replace(/\/+$/, '');
 
 if (!/^\d{6}$/.test(code ?? '')) {
-  console.error('Usage: npm run relay:claim -- <six-digit-code> [relay-base-url]');
+  console.error(
+    'Usage: codexy pair <six-digit-code> (or npm run relay:claim -- <six-digit-code>)',
+  );
   process.exit(1);
 }
 
@@ -31,7 +33,9 @@ try {
     'Installed hooks will discover this single paired device from the local Relay state.',
   );
   console.log(
-    "No bearer token is printed. Optional project alias: $env:CODEXY_PROJECT_ALIAS='My project'",
+    process.platform === 'win32'
+      ? "No bearer token is printed. Optional project alias: $env:CODEXY_PROJECT_ALIAS='My project'"
+      : "No bearer token is printed. Optional project alias: export CODEXY_PROJECT_ALIAS='My project'",
   );
 } catch (error) {
   console.error(

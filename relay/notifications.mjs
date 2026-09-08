@@ -134,6 +134,7 @@ export function notificationForEvent(event, preferences = {}) {
       project_alias: event?.project_alias ?? null,
       sessionRef: event?.session_ref ?? null,
       session_ref: event?.session_ref ?? null,
+      ...(event?.device_ref ? { device_ref: event.device_ref } : {}),
       state: event?.state ?? null,
       notificationTag: tag,
       notification_tag: tag,

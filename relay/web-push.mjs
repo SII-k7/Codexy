@@ -63,7 +63,12 @@ export function createWebPushSender(vapidConfig) {
       .filter((result) => result.status === 'expired')
       .map((result) => result.endpoint);
     return {
-      status: sent > 0 ? 'sent' : 'failed',
+      status:
+        sent > 0
+          ? 'sent'
+          : expiredEndpoints.length > 0
+            ? 'expired'
+            : 'failed',
       sent,
       expiredEndpoints,
     };

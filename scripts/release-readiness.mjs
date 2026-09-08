@@ -11,6 +11,8 @@ const manifest = readJson('public/manifest.json');
 const serviceWorker = readText('public/sw.js');
 const envExample = readText('.env.example');
 const hookInstaller = readText('scripts/install-global-hooks.ps1');
+const unixInstaller = readText('scripts/setup-codexy-unix.sh');
+const unixBootstrap = readText('install.sh');
 const startupScript = readText('scripts/start-private-pwa.ps1');
 const expo = appJson.expo;
 
@@ -70,6 +72,13 @@ requireValue(
   '全局 Hook 必须只依赖 Node.js 运行时',
 );
 requireValue(
+  unixInstaller.includes('systemctl --user') &&
+    unixInstaller.includes('launchctl bootstrap') &&
+    unixInstaller.includes('--host 127.0.0.1') &&
+    unixBootstrap.includes('scripts/setup-codexy-unix.sh'),
+  '缺少 Ubuntu/macOS 一键安装或 loopback-only 后台服务',
+);
+requireValue(
   !existsSync(resolve(root, '.codex/hooks.project-template.json')) &&
     !existsSync(resolve(root, '.codex/hooks/capture_prompt.cmd')) &&
     !existsSync(resolve(root, '.codex/hooks/capture_prompt.py')) &&
@@ -87,10 +96,13 @@ requireValue(
 );
 
 for (const file of [
+  'assets/codexy-icon-source.png',
   'assets/icon.png',
   'assets/android-icon-foreground.png',
   'assets/android-icon-monochrome.png',
   'assets/favicon.png',
+  'assets/splash-icon.png',
+  'public/apple-touch-icon-180.png',
   'public/icon-192.png',
   'public/icon-512.png',
 ]) {

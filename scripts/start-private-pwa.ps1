@@ -63,9 +63,20 @@ if (-not (Test-Path -LiteralPath (Join-Path $webRootPath 'index.html'))) {
 }
 
 Set-Location -LiteralPath $projectRoot
-& $nodeCandidates[0] `
-  "--env-file-if-exists=$envFile" `
-  $serverFile `
-  --host 127.0.0.1 `
-  >> $logPath 2>&1
-exit $LASTEXITCODE
+# Windows PowerShell turns native stderr into terminating ErrorRecords under
+# ErrorActionPreference=Stop. Redirect at the process boundary instead so a
+# recoverable Relay/App Server diagnostic cannot terminate the entire service.
+$stderrPath = Join-Path $logDirectory 'relay-stderr.log'
+$relayProcess = Start-Process `
+  -FilePath $nodeCandidates[0] `
+  -ArgumentList @("`"--env-file-if-exists=$envFile`"", "`"$serverFile`"", '--host', '127.0.0.1') `
+  -WorkingDirectory $projectRoot `
+  -WindowStyle Hidden `
+  -RedirectStandardOutput $logPath `
+  -RedirectStandardError $stderrPath `
+  -PassThru
+# Retain the native handle before waiting: Windows PowerShell otherwise may
+# return a null ExitCode after the process exits, hiding a real service failure.
+$null = $relayProcess.Handle
+$relayProcess.WaitForExit()
+exit $relayProcess.ExitCode

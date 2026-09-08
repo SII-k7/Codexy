@@ -211,5 +211,6 @@ try {
 
 Write-Output ''
 Write-Output 'Codexy desktop setup is complete.'
-Write-Output 'Next: run .\scripts\diagnose-codexy.ps1, then open the printed HTTPS URL on iPhone.'
+Write-Output 'Pair the six-digit phone code with: codexy pair 123456'
+Write-Output 'Check the installation with: codexy doctor'
 Write-Output 'Start each phone-controllable Codex session with: codexy'

@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 const DEFAULT_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_RETENTION_MS = 60 * 60 * 1000;
@@ -8,6 +8,7 @@ const FINAL_STATUSES = new Set([
   'failed',
   'canceled',
   'expired',
+  'unknown',
 ]);
 
 export class RemoteCommandError extends Error {
@@ -59,7 +60,19 @@ export function createRemoteCommandManager(options = {}) {
   const sessionTails = new Map();
   let closed = false;
 
+  function fingerprint(input) {
+    return createHash('sha256').update(JSON.stringify([
+      input.sessionRef, input.mode, input.prompt,
+    ])).digest('hex');
+  }
+
   function prune() {
+    for (const command of commands.values()) {
+      if (['queued', 'waiting'].includes(command.status) && now() >= command.expiresAtMs) {
+        setStatus(command, 'expired', '指令在发送前已过期。');
+        command.prompt = '';
+      }
+    }
     const cutoff = now() - retentionMs;
     for (const [commandId, command] of commands) {
       if (
@@ -81,9 +94,11 @@ export function createRemoteCommandManager(options = {}) {
 
   function setStatus(command, status, detail) {
     if (FINAL_STATUSES.has(command.status)) return;
+    if (command.status === status && command.statusDetail === detail) return;
     command.status = status;
     command.statusDetail = detail;
     command.updatedAt = new Date(now()).toISOString();
+    options.onChange?.();
   }
 
   async function processCommand(command) {
@@ -107,11 +122,7 @@ export function createRemoteCommandManager(options = {}) {
         if (FINAL_STATUSES.has(command.status)) return;
         setStatus(command, status, detail);
       });
-      if (command.status === 'canceled') return;
-      if (now() >= command.expiresAtMs) {
-        setStatus(command, 'expired', '指令在发送前已过期。');
-        return;
-      }
+      if (FINAL_STATUSES.has(command.status)) return;
       command.turnId = result?.turnId ?? null;
       setStatus(
         command,
@@ -121,10 +132,13 @@ export function createRemoteCommandManager(options = {}) {
           : '已发送为下一轮指令。',
       );
     } catch (error) {
-      if (command.status === 'canceled') return;
+      if (FINAL_STATUSES.has(command.status)) return;
       const failure = safeFailure(error);
       command.errorCode = failure.code;
-      setStatus(command, 'failed', failure.detail);
+      setStatus(command,
+        failure.code === 'delivery_unknown' ? 'unknown'
+          : failure.code === 'command_expired' ? 'expired' : 'failed',
+        failure.detail);
     } finally {
       // Exact remote input is intentionally memory-only and is erased as soon
       // as dispatch reaches a terminal state.
@@ -133,7 +147,9 @@ export function createRemoteCommandManager(options = {}) {
   }
 
   function scheduleCommand(command) {
-    const sessionKey = `${command.deviceId}:${command.sessionRef}`;
+    // All phones target the same desktop thread. Steer must bypass a Queue
+    // that is waiting for that very turn to finish.
+    const sessionKey = `${command.sessionRef}:${command.mode}`;
     const previous = sessionTails.get(sessionKey) ?? Promise.resolve();
     const scheduled = previous
       .catch(() => {
@@ -162,7 +178,12 @@ export function createRemoteCommandManager(options = {}) {
     const existingId = idempotency.get(idempotencyKey);
     if (existingId) {
       const existing = commands.get(existingId);
-      if (existing) return publicCommand(existing);
+      if (existing) {
+        if (existing.fingerprint !== fingerprint(input)) {
+          throw new RemoteCommandError('idempotency_conflict', '请求编号已用于不同的目标或内容。');
+        }
+        return publicCommand(existing);
+      }
     }
 
     const deviceCommands = commandsByDevice.get(input.deviceId) ?? [];
@@ -188,6 +209,7 @@ export function createRemoteCommandManager(options = {}) {
       prompt: input.prompt,
       promptLength: input.prompt.length,
       idempotencyKey: input.idempotencyKey,
+      fingerprint: fingerprint(input),
       status: 'queued',
       statusDetail: '已进入本机内存队列。',
       createdAt: new Date(createdAtMs).toISOString(),
@@ -200,11 +222,23 @@ export function createRemoteCommandManager(options = {}) {
     commands.set(command.commandId, command);
     commandsByDevice.set(
       input.deviceId,
-      [...deviceCommands, command.commandId].slice(-MAX_COMMANDS_PER_DEVICE),
+      [...deviceCommands, command.commandId],
     );
     idempotency.set(idempotencyKey, command.commandId);
+    options.onChange?.();
     scheduleCommand(command);
     return publicCommand(command);
+  }
+
+  function findExisting(input) {
+    prune();
+    const id = idempotency.get(`${input.deviceId}:${input.idempotencyKey}`);
+    const existing = commands.get(id);
+    if (!existing) return null;
+    if (existing.fingerprint !== fingerprint(input)) {
+      throw new RemoteCommandError('idempotency_conflict', '请求编号已用于不同的目标或内容。');
+    }
+    return publicCommand(existing);
   }
 
   function list(deviceId) {
@@ -258,6 +292,7 @@ export function createRemoteCommandManager(options = {}) {
 
   function close() {
     closed = true;
+    clearInterval(expiryTimer);
     for (const command of commands.values()) {
       if (!FINAL_STATUSES.has(command.status)) {
         setStatus(command, 'canceled', '桌面服务已关闭。');
@@ -267,5 +302,7 @@ export function createRemoteCommandManager(options = {}) {
     sessionTails.clear();
   }
 
-  return { cancel, close, enqueue, get, list, removeDevice };
+  const expiryTimer = setInterval(prune, Math.min(ttlMs, 1000));
+  expiryTimer.unref?.();
+  return { cancel, close, enqueue, findExisting, get, list, removeDevice };
 }

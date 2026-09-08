@@ -18,7 +18,7 @@ import { normalizeDevicePreferences } from './notifications.mjs';
 const STORE_VERSION = 1;
 const MAX_EVENTS_PER_DEVICE = 100;
 const MAX_WEB_PUSH_SUBSCRIPTIONS = 8;
-const MAX_AGENT_SESSIONS = 16;
+const MAX_AGENT_SESSIONS = 128;
 const MAX_PROMPTS_PER_SESSION = 10;
 
 function emptyStore() {

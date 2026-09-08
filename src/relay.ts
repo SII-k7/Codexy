@@ -8,11 +8,33 @@ import type {
   DevicePreferences,
   DeviceRegistration,
   DeviceStatus,
+  PairingCodeRenewal,
   RemotePromptCommand,
   RemotePromptMode,
+  TestNotificationResult,
+  RelaySnapshot,
+  SavedDevice,
 } from './types';
 
 const REQUEST_TIMEOUT_MS = 5000;
+
+export async function watchRelayChanges(device: SavedDevice, revision: string | null, signal: AbortSignal): Promise<{ revision: string; changed: boolean }> {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal.addEventListener('abort', abort, { once: true });
+  if (signal.aborted) abort();
+  const timer = setTimeout(abort, 35_000);
+  try {
+    const response = await fetch(`${normalizeRelayUrl(device.relayUrl)}/v1/devices/${encodeURIComponent(device.deviceId)}/changes${revision ? `?after=${encodeURIComponent(revision)}` : ''}`, {
+      headers: { Authorization: `Bearer ${device.deviceSecret}`, Accept: 'application/json' },
+      signal: controller.signal, cache: 'no-store',
+    });
+    if (!response.ok) throw new RelayError(`状态连接返回 HTTP ${response.status}`, response.status);
+    const result = await response.json();
+    if (typeof result.revision !== 'string' || typeof result.changed !== 'boolean') throw new RelayError('状态连接响应无效');
+    return result;
+  } finally { clearTimeout(timer); signal.removeEventListener('abort', abort); }
+}
 
 export class RelayError extends Error {
   constructor(
@@ -28,12 +50,33 @@ export function normalizeRelayUrl(value: string): string {
   return value.trim().replace(/\/+$/, '');
 }
 
+export async function getRelaySnapshot(device: SavedDevice): Promise<RelaySnapshot> {
+  try {
+    return await requestJson<RelaySnapshot>(
+      `${normalizeRelayUrl(device.relayUrl)}/v1/devices/${encodeURIComponent(device.deviceId)}/snapshot`,
+      { headers: { Authorization: `Bearer ${device.deviceSecret}` } },
+    );
+  } catch (error) {
+    if (!(error instanceof RelayError && error.status === 404)) throw error;
+    // Older desktops can be upgraded independently.
+    const { relayUrl, deviceId, deviceSecret } = device;
+    const [status, sessions, commands, eventResult] = await Promise.all([
+      getDeviceStatus(relayUrl, deviceId, deviceSecret),
+      getAgentSessions(relayUrl, deviceId, deviceSecret),
+      getRemotePromptCommands(relayUrl, deviceId, deviceSecret),
+      getEvents(relayUrl, deviceId, deviceSecret, 0),
+    ]);
+    return { status, sessions, commands, ...eventResult, generated_at: new Date().toISOString() };
+  }
+}
+
 async function requestJson<T>(
   url: string,
   init: RequestInit = {},
+  timeoutMs = REQUEST_TIMEOUT_MS,
 ): Promise<T> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(url, {
@@ -114,6 +157,36 @@ export async function getDeviceStatus(
     `${normalizeRelayUrl(relayUrl)}/v1/devices/${encodeURIComponent(deviceId)}/status`,
     {
       headers: { Authorization: `Bearer ${deviceSecret}` },
+    },
+  );
+}
+
+export async function renewPairingCode(input: {
+  relayUrl: string;
+  deviceId: string;
+  deviceSecret: string;
+}): Promise<PairingCodeRenewal> {
+  return requestJson<PairingCodeRenewal>(
+    `${normalizeRelayUrl(input.relayUrl)}/v1/devices/${encodeURIComponent(input.deviceId)}/pairing-code`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${input.deviceSecret}` },
+      body: JSON.stringify({}),
+    },
+  );
+}
+
+export async function sendTestNotification(input: {
+  relayUrl: string;
+  deviceId: string;
+  deviceSecret: string;
+}): Promise<TestNotificationResult> {
+  return requestJson<TestNotificationResult>(
+    `${normalizeRelayUrl(input.relayUrl)}/v1/devices/${encodeURIComponent(input.deviceId)}/test-notification`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${input.deviceSecret}` },
+      body: JSON.stringify({}),
     },
   );
 }
@@ -319,4 +392,12 @@ export async function acknowledgeEvent(
       body: JSON.stringify({}),
     },
   );
+}
+
+export async function getSessionRuntime(device: SavedDevice, sessionRef: string): Promise<import('./types').CodexSessionRuntime> {
+  const result = await requestJson<{ runtime: import('./types').CodexSessionRuntime }>(`${normalizeRelayUrl(device.relayUrl)}/v1/devices/${encodeURIComponent(device.deviceId)}/sessions/${encodeURIComponent(sessionRef)}/runtime`, { headers: { Authorization: `Bearer ${device.deviceSecret}` } }, 20000);
+  return result.runtime;
+}
+export async function updateSessionGoal(device: SavedDevice, sessionRef: string, input: import('./types').CodexGoalInput): Promise<{ goal: import('./types').CodexGoal | null }> {
+  return requestJson(`${normalizeRelayUrl(device.relayUrl)}/v1/devices/${encodeURIComponent(device.deviceId)}/sessions/${encodeURIComponent(sessionRef)}/goal`, { method: 'PATCH', headers: { Authorization: `Bearer ${device.deviceSecret}` }, body: JSON.stringify(input) }, 20000);
 }

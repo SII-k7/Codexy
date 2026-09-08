@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "C:\\Windows\\System32\\cmd.exe /d /s /c call \"%USERPROFILE%\\.codex\\codexy-hooks\\capture_prompt.cmd\"",
+            "command": "/bin/sh -c 'exec \"${CODEX_HOME:-$HOME/.codex}/codexy-hooks/capture_prompt.sh\"'",
             "commandWindows": "C:\\Windows\\System32\\cmd.exe /d /s /c call \"%USERPROFILE%\\.codex\\codexy-hooks\\capture_prompt.cmd\"",
             "timeout": 5,
             "statusMessage": "Updating your private CLI track"
@@ -20,7 +20,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "C:\\Windows\\System32\\cmd.exe /d /s /c call \"%USERPROFILE%\\.codex\\codexy-hooks\\notify_mobile.cmd\"",
+            "command": "/bin/sh -c 'exec \"${CODEX_HOME:-$HOME/.codex}/codexy-hooks/notify_mobile.sh\"'",
             "commandWindows": "C:\\Windows\\System32\\cmd.exe /d /s /c call \"%USERPROFILE%\\.codex\\codexy-hooks\\notify_mobile.cmd\"",
             "timeout": 5,
             "statusMessage": "Notifying your paired phone"
@@ -33,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "C:\\Windows\\System32\\cmd.exe /d /s /c call \"%USERPROFILE%\\.codex\\codexy-hooks\\notify_mobile.cmd\"",
+            "command": "/bin/sh -c 'exec \"${CODEX_HOME:-$HOME/.codex}/codexy-hooks/notify_mobile.sh\"'",
             "commandWindows": "C:\\Windows\\System32\\cmd.exe /d /s /c call \"%USERPROFILE%\\.codex\\codexy-hooks\\notify_mobile.cmd\"",
             "timeout": 5
           }
@@ -45,7 +45,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "C:\\Windows\\System32\\cmd.exe /d /s /c call \"%USERPROFILE%\\.codex\\codexy-hooks\\notify_mobile.cmd\"",
+            "command": "/bin/sh -c 'exec \"${CODEX_HOME:-$HOME/.codex}/codexy-hooks/notify_mobile.sh\"'",
             "commandWindows": "C:\\Windows\\System32\\cmd.exe /d /s /c call \"%USERPROFILE%\\.codex\\codexy-hooks\\notify_mobile.cmd\"",
             "timeout": 3
           }

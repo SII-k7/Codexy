@@ -20,9 +20,11 @@ $sourceHooksPath = Join-Path $sourceDirectory 'hooks.json'
 $managedFiles = @(
   'capture_prompt.cmd',
   'capture_prompt.mjs',
+  'capture_prompt.sh',
   'hook_common.mjs',
   'notify_mobile.cmd',
   'notify_mobile.mjs',
+  'notify_mobile.sh',
   'hooks.json',
   'README.md'
 )

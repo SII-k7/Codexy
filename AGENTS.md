@@ -1,11 +1,13 @@
 # Codexy engineering guide
 
-Codexy 是面向 Codex CLI 的非官方、单用户、本机优先手机伴侣。MVP 只维护：
-状态推送、最新回复速览、会话控制、远程 Prompt、最近 10 条脱敏 Prompt、项目思路整理。
+Codexy 是面向多个 Codex CLI Agent 的非官方、单用户、本机优先移动注意力控制台。
+MVP 只维护：注意力队列、状态推送、最新回复速览、会话控制、远程 Prompt、
+最近 10 条脱敏 Prompt，以及任务、挑战与下一步三段式简报。
 
 ## Commands
 
 - `npm run typecheck`: 检查 Expo/React Native TypeScript。
+- `npm run app:test`: 测试注意力排序、回复速览接入和项目方向整理。
 - `npm run relay:test`: 测试配对、鉴权、事件、会话隔离、Prompt 队列与隐私边界。
 - `npm run check`: 运行全部静态检查和 Relay 测试。
 - `npm run private:build`: 构建并验证私有 PWA。
@@ -17,6 +19,10 @@ Codexy 是面向 Codex CLI 的非官方、单用户、本机优先手机伴侣�
 - 每个并行 Codex CLI 必须是独立轨道，只向手机暴露哈希会话标识和项目别名。
 - `needs_you` 必须产生清晰的视觉状态和可选推送；点击含 `session_ref` 的通知必须
   回到对应会话。
+- 首页行动顺序必须稳定遵循 `needs_you → failed → interrupted →
+  completed/turn_finished/subtask_completed`；正常 `working` 不进入待接棒数量。
+- 首页必须明确区分“Agent 做了什么”和“你现在做什么”；初始可使用生命周期摘要。
+  只有用户点击本机提炼或打开会话页后，才可按需读取最新回复速览，不得静默批量读取。
 - 会话页必须优先呈现最新一轮已结束的 Codex 回复速览；控制台默认折叠，只在用户
   主动展开后占用完整空间。
 - 回复速览只能按需读取最新一轮已结束的 `agentMessage`，优先选择
@@ -24,6 +30,8 @@ Codexy 是面向 Codex CLI 的非官方、单用户、本机优先手机伴侣�
   2–4 条结构化要点；完整回复不得进入推送或 Relay 持久状态。
 - 推送不得包含原始 Prompt、代码、路径、URL、邮箱、密钥、工具输入输出或对话。
 - 每个会话最多保留 10 条脱敏用户 Prompt，最多 24 小时；回放不得触发推送。
+- 项目方向时间线最多显示 5 个关键节点，并以 P01–P10 标明来源；关键词分类不得
+  冒充模型理解或项目事实。
 - 任何整理或建议 Prompt 都必须让用户复核；不得自动提交。
 - 手机完整 Prompt 必须先确认目标和文本，长度不超过 4,000 字符。Queue 是默认
   模式；Steer 必须显式选择并带 active turn 前置条件。

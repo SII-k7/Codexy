@@ -42,15 +42,19 @@ function statusCopy(summary: CodexReplySummary): string {
 }
 
 export function CodexReplySummaryCard(props: {
+  compact?: boolean;
+  fallback?: string;
   controlStatus: NonNullable<AgentSession['control_status']>;
+  initialSummary?: CodexReplySummary;
   online: boolean;
   sessionRef: string;
   sessionUpdatedAt: string;
   onLoad: () => Promise<CodexReplySummary>;
 }) {
   const [summary, setSummary] = useState<CodexReplySummary | null>(
-    null,
+    props.initialSummary ?? null,
   );
+  const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -108,13 +112,25 @@ export function CodexReplySummaryCard(props: {
     props.sessionUpdatedAt,
   ]);
 
+  if (props.compact) return <View style={{ borderTopWidth: 1, borderBottomWidth: 1, borderColor: '#ECEEF0', paddingVertical: 18, gap: 10 }}>
+    <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+      <Text style={{ fontSize: 16, fontWeight: '600', color: '#25292F' }}>最近进展</Text>
+      {props.controlStatus === 'ready' ? <Pressable accessibilityRole="button" accessibilityLabel="刷新最近进展" disabled={loading || !props.online} onPress={() => void load()} style={{ minHeight: 44, minWidth: 44, justifyContent: 'center', alignItems: 'flex-end' }}>
+        <Text style={{ color: '#6B7280', fontSize: 13 }}>{loading ? '读取中…' : '刷新'}</Text>
+      </Pressable> : null}
+    </View>
+    <Text style={{ fontSize: 16, lineHeight: 26, color: '#353B44' }}>{summary?.available ? summary.headline : props.fallback || '暂时没有进展摘要。'}</Text>
+    {summary?.available ? summary.highlights.slice(0, 2).map((item, index) => <Text key={index} style={{ fontSize: 14, lineHeight: 24, color: '#646C77' }}>· {item.text}</Text>) : null}
+    {summary?.available && summary.current_turn_active ? <Text style={{ fontSize: 12, color: '#747B85' }}>以上为上一轮结果，当前回合仍在推进。</Text> : null}
+    {error ? <Text accessibilityRole="alert" style={{ fontSize: 13, color: '#A34435' }}>最近回复暂时无法读取，显示已同步进展。</Text> : null}
+  </View>;
+
   if (props.controlStatus !== 'ready') {
     return (
       <View style={styles.unavailableCard}>
-        <Text style={styles.eyebrow}>LAST REPLY</Text>
-        <Text style={styles.unavailableTitle}>回复速览尚不可用</Text>
+        <Text style={styles.unavailableTitle}>本轮结果暂不可用</Text>
         <Text style={styles.unavailableBody}>
-          用 codexy 打开这条会话后，最近一次最终回复会在这里生成本机速览。
+          用 codexy 打开会话后即可生成摘要。
         </Text>
       </View>
     );
@@ -124,11 +140,12 @@ export function CodexReplySummaryCard(props: {
     <View style={styles.card}>
       <View style={styles.heading}>
         <View style={styles.headingCopy}>
-          <Text style={styles.eyebrow}>LAST REPLY</Text>
-          <Text style={styles.title}>Codex 回复速览</Text>
+          <Text style={styles.title}>本轮结果</Text>
         </View>
         <Pressable
+          accessibilityLabel={loading ? '正在刷新回复速览' : '刷新回复速览'}
           accessibilityRole="button"
+          accessibilityState={{ busy: loading, disabled: loading || !props.online }}
           disabled={loading || !props.online}
           onPress={() => void load()}
           style={styles.refreshButton}
@@ -163,38 +180,50 @@ export function CodexReplySummaryCard(props: {
               {formatTime(summary.completed_at)}
             </Text>
           </View>
-          <Text style={styles.headline}>{summary.headline}</Text>
+          <Text numberOfLines={3} style={styles.headline}>{summary.headline}</Text>
           {summary.highlights.length ? (
-            <View style={styles.highlights}>
-              {summary.highlights.map((highlight, index) => {
-                const tone = KIND_TONES[highlight.kind];
-                return (
-                  <View
-                    key={`${highlight.kind}-${index}-${highlight.text}`}
-                    style={styles.highlight}
-                  >
-                    <Text
-                      style={[
-                        styles.highlightLabel,
-                        {
-                          backgroundColor: tone.background,
-                          color: tone.foreground,
-                        },
-                      ]}
-                    >
-                      {highlight.label}
-                    </Text>
-                    <Text style={styles.highlightText}>
-                      {highlight.text}
-                    </Text>
-                  </View>
-                );
-              })}
-            </View>
+            <>
+              <Pressable
+                accessibilityLabel={`本轮结果详情，${summary.highlights.length} 条。${expanded ? '已展开' : '已收起'}`}
+                accessibilityRole="button"
+                accessibilityState={{ expanded }}
+                onPress={() => setExpanded((current) => !current)}
+                style={styles.disclosure}
+              >
+                <Text style={styles.disclosureText}>
+                  {expanded ? '收起详情' : `查看 ${summary.highlights.length} 条详情`}
+                </Text>
+              </Pressable>
+              {expanded ? (
+                <View style={styles.highlights}>
+                  {summary.highlights.map((highlight, index) => {
+                    const tone = KIND_TONES[highlight.kind];
+                    return (
+                      <View
+                        key={`${highlight.kind}-${index}-${highlight.text}`}
+                        style={styles.highlight}
+                      >
+                        <Text
+                          style={[
+                            styles.highlightLabel,
+                            {
+                              backgroundColor: tone.background,
+                              color: tone.foreground,
+                            },
+                          ]}
+                        >
+                          {highlight.label}
+                        </Text>
+                        <Text style={styles.highlightText}>
+                          {highlight.text}
+                        </Text>
+                      </View>
+                    );
+                  })}
+                </View>
+              ) : null}
+            </>
           ) : null}
-          <Text style={styles.privacyNote}>
-            本机提炼 · 完整回复未同步 · 不进入通知或持久状态
-          </Text>
         </>
       ) : !loading && props.online ? (
         <View style={styles.emptyState}>
@@ -220,10 +249,10 @@ export function CodexReplySummaryCard(props: {
 
 const styles = StyleSheet.create({
   card: {
-    backgroundColor: '#F2F1EC',
+    backgroundColor: '#FFFFFF',
     borderColor: '#D9D7CE',
     borderWidth: 1,
-    marginTop: 22,
+    marginTop: 18,
     padding: 16,
   },
   heading: {
@@ -232,42 +261,35 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   headingCopy: { flex: 1 },
-  eyebrow: {
-    color: '#7A786F',
-    fontSize: 8,
-    fontWeight: '800',
-    letterSpacing: 1.6,
-  },
   title: {
     color: '#20201D',
-    fontSize: 17,
-    fontWeight: '700',
-    marginTop: 6,
+    fontSize: 18,
+    fontWeight: '800',
   },
   refreshButton: {
     alignItems: 'center',
     borderColor: '#C9C6BC',
     borderWidth: 1,
     justifyContent: 'center',
-    minHeight: 32,
+    minHeight: 44,
     minWidth: 50,
     paddingHorizontal: 9,
   },
   refreshText: {
     color: '#595850',
-    fontSize: 9,
+    fontSize: 10,
     fontWeight: '700',
   },
   statusRow: {
     alignItems: 'center',
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginTop: 17,
+    marginTop: 14,
   },
   statusBadge: {
     backgroundColor: '#DDE8D4',
     color: '#43553A',
-    fontSize: 8,
+    fontSize: 9,
     fontWeight: '800',
     overflow: 'hidden',
     paddingHorizontal: 7,
@@ -278,15 +300,15 @@ const styles = StyleSheet.create({
     color: '#75483E',
   },
   statusTime: {
-    color: '#8B897F',
-    fontSize: 8,
+    color: '#69675F',
+    fontSize: 10,
     fontVariant: ['tabular-nums'],
   },
   headline: {
     color: '#24241F',
-    fontSize: 16,
-    fontWeight: '700',
-    lineHeight: 24,
+    fontSize: 17,
+    fontWeight: '800',
+    lineHeight: 25,
     marginTop: 10,
   },
   highlights: {
@@ -296,6 +318,15 @@ const styles = StyleSheet.create({
     marginTop: 14,
     paddingTop: 13,
   },
+  disclosure: {
+    alignItems: 'flex-start',
+    borderTopColor: '#D8D5CC',
+    borderTopWidth: 1,
+    justifyContent: 'center',
+    marginTop: 14,
+    minHeight: 44,
+  },
+  disclosureText: { color: '#56534C', fontSize: 12, fontWeight: '800' },
   highlight: {
     alignItems: 'flex-start',
     flexDirection: 'row',
@@ -315,12 +346,6 @@ const styles = StyleSheet.create({
     flex: 1,
     fontSize: 11,
     lineHeight: 18,
-  },
-  privacyNote: {
-    color: '#96938A',
-    fontSize: 8,
-    lineHeight: 13,
-    marginTop: 15,
   },
   emptyState: {
     borderTopColor: '#D8D5CC',
@@ -350,7 +375,7 @@ const styles = StyleSheet.create({
   unavailableCard: {
     borderColor: '#D5D3CB',
     borderWidth: 1,
-    marginTop: 22,
+    marginTop: 18,
     padding: 14,
   },
   unavailableTitle: {

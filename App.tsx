@@ -1,10 +1,16 @@
 import { StatusBar } from 'expo-status-bar';
+import { hostKey } from './src/fleet';
+import { createLiveSync } from './src/liveSync';
+import { bindForegroundSync } from './src/foregroundSync';
+import { watchRelayChanges } from './src/relay';
+import { createPromptSender } from './src/promptDelivery';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { FRESHNESS_MS } from './src/fleet';
 import {
   ActivityIndicator,
-  Alert,
   Image,
   KeyboardAvoidingView,
+  Modal,
   Platform,
   Pressable,
   RefreshControl,
@@ -16,8 +22,14 @@ import {
   View,
 } from 'react-native';
 
+import {
+  attentionPriorityFor,
+  buildAttentionQueue,
+} from './src/attention';
+import { AttentionQueue } from './src/components/AttentionQueue';
 import { CodexSessionCard } from './src/components/CodexSessionCard';
 import { CodexSessionScreen } from './src/components/CodexSessionScreen';
+import { SpringPressable } from './src/components/SpringPressable';
 import {
   getInitialNotificationSessionRef,
   listenForNotificationSession,
@@ -29,28 +41,43 @@ import {
   cancelRemotePrompt,
   deleteDevice,
   getAgentSessions,
+  getRelaySnapshot,
   getDeviceStatus,
   getEvents,
   getRemotePromptCommands,
   getSessionControl,
+  getSessionRuntime,
+  updateSessionGoal,
   getSessionReplySummary,
   normalizeRelayUrl,
   registerDevice,
+  renewPairingCode,
   runSessionControlAction,
   sendRemotePrompt,
+  sendTestNotification,
   updateDevicePreferences,
   updateSessionControl,
 } from './src/relay';
 import {
   clearAllCodexyStorage,
+  loadHiddenSessionRefs,
+  loadNotificationTestConfirmed,
   loadSavedDevice,
   saveDevice,
+  saveHiddenSessionRefs,
+  saveNotificationTestConfirmed,
 } from './src/storage';
+import {
+  attentionEligibleSessions as filterAttentionEligibleSessions,
+  visibleSessionTracks,
+} from './src/sessionVisibility';
 import {
   DEFAULT_WEB_PUSH_STATUS,
   disableWebPush,
   enableWebPush,
   getWebPushStatus,
+  requiresStandaloneInstall,
+  resetExpiredWebPush,
   syncWebPush,
 } from './src/webPush';
 import type { WebPushStatus } from './src/webPushTypes';
@@ -73,17 +100,21 @@ import type {
 type MainTab = 'workbench' | 'settings';
 type SessionFilter = 'all' | 'attention' | 'running' | 'review';
 
+interface CachedReplySummary {
+  sessionUpdatedAt: string;
+  summary: CodexReplySummary;
+}
+
 const SESSION_FILTERS: Array<{
   id: SessionFilter;
   label: string;
 }> = [
   { id: 'all', label: '全部' },
-  { id: 'attention', label: '需处理' },
+  { id: 'attention', label: '待接棒' },
   { id: 'running', label: '运行中' },
   { id: 'review', label: '待复核' },
 ];
 
-const POLL_INTERVAL_MS = 2_500;
 
 const DEFAULT_NOTIFICATION_PREFERENCES: DevicePreferences = {
   notification_tone: 'calm',
@@ -318,27 +349,32 @@ function formatClock(value: string): string {
   }).format(date);
 }
 
-function Metric(props: { label: string; value: string; urgent?: boolean }) {
-  return (
-    <View style={[styles.metric, props.urgent && styles.metricUrgent]}>
-      <Text
-        style={[
-          styles.metricValue,
-          props.urgent && styles.metricTextUrgent,
-        ]}
-      >
-        {props.value}
-      </Text>
-      <Text
-        style={[
-          styles.metricLabel,
-          props.urgent && styles.metricTextUrgent,
-        ]}
-      >
-        {props.label}
-      </Text>
-    </View>
-  );
+function formatSyncTimestamp(value: number): string {
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(new Date(value));
+}
+
+function pairingExpiryStatus(value: string | null): {
+  expired: boolean;
+  label: string;
+} {
+  const timestamp = value ? new Date(value).getTime() : Number.NaN;
+  if (!Number.isFinite(timestamp)) {
+    return { expired: true, label: '有效期未知，请生成新配对码' };
+  }
+  const remaining = timestamp - Date.now();
+  if (remaining <= 0) {
+    return { expired: true, label: '配对码已过期' };
+  }
+  return {
+    expired: false,
+    label: `约 ${Math.max(1, Math.ceil(remaining / 60_000))} 分钟后失效`,
+  };
 }
 
 function BottomNavigation(props: {
@@ -355,14 +391,17 @@ function BottomNavigation(props: {
       ).map(([id, label]) => {
         const active = props.active === id;
         return (
-          <Pressable
+          <SpringPressable
+            accessibilityLabel={label}
             accessibilityRole="tab"
             accessibilityState={{ selected: active }}
             key={id}
             onPress={() => props.onChange(id)}
+            pressedScale={0.96}
             style={styles.bottomTab}
           >
             <Text
+              accessible={false}
               style={[
                 styles.bottomTabDot,
                 active && styles.bottomTabTextActive,
@@ -371,6 +410,7 @@ function BottomNavigation(props: {
               {active ? '●' : '○'}
             </Text>
             <Text
+              accessible={false}
               style={[
                 styles.bottomTabText,
                 active && styles.bottomTabTextActive,
@@ -378,17 +418,26 @@ function BottomNavigation(props: {
             >
               {label}
             </Text>
-          </Pressable>
+          </SpringPressable>
         );
       })}
     </View>
   );
 }
 
-export default function App() {
+const reviewedPromptSender = createPromptSender(sendRemotePrompt,
+  (error) => error instanceof RelayError && error.status !== undefined && error.status >= 400 && error.status < 500);
+
+export default function App(props: {
+  initialDevice?: SavedDevice;
+  initialSession?: AgentSession;
+  onExit?: () => void;
+  onDeviceRemoved?: () => Promise<void>;
+} = {}) {
+  const storageScope = props.initialDevice ? hostKey(props.initialDevice) : undefined;
   const [booting, setBooting] = useState(true);
   const [activeTab, setActiveTab] = useState<MainTab>('workbench');
-  const [savedDevice, setSavedDevice] = useState<SavedDevice | null>(null);
+  const [savedDevice, setSavedDevice] = useState<SavedDevice | null>(props.initialDevice ?? null);
   const [previewMode, setPreviewMode] = useState(false);
   const [relayInput, setRelayInput] = useState(inferDefaultRelayUrl());
   const [showAdvancedRelay, setShowAdvancedRelay] = useState(false);
@@ -396,20 +445,36 @@ export default function App() {
   const [connecting, setConnecting] = useState(false);
   const [paired, setPaired] = useState(false);
   const [pairingCode, setPairingCode] = useState<string | null>(null);
+  const [pairingExpiresAt, setPairingExpiresAt] = useState<string | null>(null);
+  const [pairingRenewBusy, setPairingRenewBusy] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [connectionNote, setConnectionNote] = useState('');
   const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const [events, setEvents] = useState<AgentEvent[]>([]);
-  const [sessions, setSessions] = useState<AgentSession[]>([]);
+  const [sessions, setSessions] = useState<AgentSession[]>(props.initialSession ? [props.initialSession] : []);
+  const [hiddenSessionRefs, setHiddenSessionRefs] = useState<string[]>([]);
   const [commands, setCommands] = useState<RemotePromptCommand[]>([]);
+  const [replySummaryCache, setReplySummaryCache] = useState<
+    Record<string, CachedReplySummary>
+  >({});
+  const [summarizingSessionRef, setSummarizingSessionRef] = useState<
+    string | null
+  >(null);
   const [selectedSessionRef, setSelectedSessionRef] = useState<string | null>(
     null,
   );
+  const [pendingHiddenSession, setPendingHiddenSession] =
+    useState<AgentSession | null>(null);
+  const [resetConfirmationVisible, setResetConfirmationVisible] =
+    useState(false);
   const [requestedSessionRef, setRequestedSessionRef] = useState<string | null>(
-    requestedSessionFromUrl,
+    () => props.initialSession?.session_ref ?? requestedSessionFromUrl(),
   );
   const [cursor, setCursor] = useState(0);
   const cursorRef = useRef(0);
+  const refreshEpochRef = useRef(0);
+  const refreshInFlightRef = useRef<Promise<void> | null>(null);
   const previewControlsRef = useRef(
     new Map<string, CodexControlSnapshot>(),
   );
@@ -418,6 +483,10 @@ export default function App() {
     DEFAULT_WEB_PUSH_STATUS,
   );
   const [webPushBusy, setWebPushBusy] = useState(false);
+  const [notificationTestBusy, setNotificationTestBusy] = useState(false);
+  const [notificationTestSent, setNotificationTestSent] = useState(false);
+  const [notificationTestConfirmed, setNotificationTestConfirmed] =
+    useState(false);
   const [notificationPreferences, setNotificationPreferences] =
     useState<DevicePreferences>(DEFAULT_NOTIFICATION_PREFERENCES);
   const [notificationPreferencesBusy, setNotificationPreferencesBusy] =
@@ -429,13 +498,35 @@ export default function App() {
   });
 
   useEffect(() => {
-    void loadSavedDevice()
-      .then((device) => {
+    void Promise.all([
+      props.initialDevice ? Promise.resolve(props.initialDevice) : props.onExit ? Promise.resolve(null) : loadSavedDevice(),
+      loadHiddenSessionRefs(storageScope).catch(() => []),
+    ])
+      .then(([device, hiddenRefs]) => {
         setSavedDevice(device);
+        setHiddenSessionRefs(hiddenRefs);
         setRelayInput(device?.relayUrl ?? inferDefaultRelayUrl());
       })
       .finally(() => setBooting(false));
   }, []);
+
+  useEffect(() => {
+    if (previewMode) {
+      setNotificationTestConfirmed(true);
+      return;
+    }
+    if (!savedDevice) {
+      setNotificationTestConfirmed(false);
+      return;
+    }
+    let active = true;
+    void loadNotificationTestConfirmed(savedDevice).then((confirmed) => {
+      if (active) setNotificationTestConfirmed(confirmed);
+    });
+    return () => {
+      active = false;
+    };
+  }, [previewMode, savedDevice]);
 
   useEffect(() => {
     void getInitialNotificationSessionRef().then((sessionRef) => {
@@ -455,87 +546,154 @@ export default function App() {
         })
       : getWebPushStatus();
     void statusPromise.then((status) => {
-      if (active) setWebPushStatus(status);
+      if (!active) return;
+      setWebPushStatus(status);
+      if (!previewMode && status.phase !== 'subscribed') {
+        setNotificationTestSent(false);
+        setNotificationTestConfirmed(false);
+        if (savedDevice) {
+          void saveNotificationTestConfirmed(savedDevice, false).catch(
+            () => undefined,
+          );
+        }
+      }
     });
     return () => {
       active = false;
     };
-  }, [booting, savedDevice]);
+  }, [booting, previewMode, savedDevice]);
+
+  useEffect(() => {
+    refreshEpochRef.current += 1;
+    refreshInFlightRef.current = null;
+  }, [savedDevice?.deviceId, savedDevice?.relayUrl]);
 
   const refresh = useCallback(async () => {
     if (!savedDevice) return;
-    try {
-      const [eventResult, status, sessionResult, commandResult] =
-        await Promise.all([
-          getEvents(
-            savedDevice.relayUrl,
-            savedDevice.deviceId,
-            savedDevice.deviceSecret,
-            cursorRef.current,
-          ),
-          getDeviceStatus(
-            savedDevice.relayUrl,
-            savedDevice.deviceId,
-            savedDevice.deviceSecret,
-          ),
-          getAgentSessions(
-            savedDevice.relayUrl,
-            savedDevice.deviceId,
-            savedDevice.deviceSecret,
-          ),
-          getRemotePromptCommands(
-            savedDevice.relayUrl,
-            savedDevice.deviceId,
-            savedDevice.deviceSecret,
-          ),
-        ]);
+    if (refreshInFlightRef.current) {
+      await refreshInFlightRef.current;
+      return;
+    }
+    const requestEpoch = refreshEpochRef.current;
+    const request = (async () => {
+      try {
+        const snapshot = await getRelaySnapshot(savedDevice);
+        if (snapshot.hub_online === false) throw new RelayError('电脑已离线，保留的任务进度待确认；当前无法发送指令。');
+        const { status, sessions: sessionResult, commands: commandResult } = snapshot;
+        const eventResult = snapshot;
 
-      if (eventResult.events.length) {
-        setEvents((current) => {
-          const byId = new Map(current.map((event) => [event.event_id, event]));
-          for (const event of eventResult.events) {
-            if (event.source === 'codex') byId.set(event.event_id, event);
-          }
-          return [...byId.values()]
-            .sort((left, right) => right.cursor - left.cursor)
-            .slice(0, 30);
-        });
+        if (requestEpoch !== refreshEpochRef.current) return;
+        if (eventResult.events.length) {
+          setEvents((current) => {
+            const byId = new Map(
+              current.map((event) => [event.event_id, event]),
+            );
+            for (const event of eventResult.events) {
+              if (event.source === 'codex') byId.set(event.event_id, event);
+            }
+            return [...byId.values()]
+              .sort((left, right) => right.cursor - left.cursor)
+              .slice(0, 30);
+          });
+        }
+        cursorRef.current = eventResult.next_cursor;
+        setCursor(eventResult.next_cursor);
+        setPaired(status.paired);
+        setPairingCode(status.pairing_code);
+        setPairingExpiresAt(status.pairing_expires_at);
+        setNotificationPreferences(
+          status.preferences ?? DEFAULT_NOTIFICATION_PREFERENCES,
+        );
+        setRemoteControl(
+          status.remote_control ?? {
+            state: 'disabled',
+            detail: '当前 Relay 尚未启用手机控制。',
+            endpoint: null,
+          },
+        );
+        setSessions(
+          sessionResult.filter((session) => session.source === 'codex'),
+        );
+        setCommands(commandResult);
+        setLastSyncAt(Date.now());
+        setSyncError(null);
+        setConnectionError(null);
+      } catch (error) {
+        if (requestEpoch !== refreshEpochRef.current) return;
+        const message =
+          error instanceof Error ? error.message : 'Codex 状态同步失败。';
+        setSyncError(message);
+        setConnectionError(message);
       }
-      cursorRef.current = eventResult.next_cursor;
-      setCursor(eventResult.next_cursor);
-      setPaired(status.paired);
-      setPairingCode(status.pairing_code);
-      setNotificationPreferences(
-        status.preferences ?? DEFAULT_NOTIFICATION_PREFERENCES,
-      );
-      setRemoteControl(
-        status.remote_control ?? {
-          state: 'disabled',
-          detail: '当前 Relay 尚未启用手机控制。',
-          endpoint: null,
-        },
-      );
-      setSessions(
-        sessionResult.filter((session) => session.source === 'codex'),
-      );
-      setCommands(commandResult);
-      setLastSyncAt(Date.now());
-      setConnectionError(null);
-    } catch (error) {
-      setConnectionError(
-        error instanceof Error ? error.message : 'Codex 状态同步失败。',
-      );
+    })();
+    refreshInFlightRef.current = request;
+    try {
+      await request;
+    } finally {
+      if (refreshInFlightRef.current === request) {
+        refreshInFlightRef.current = null;
+      }
     }
   }, [savedDevice]);
 
   useEffect(() => {
-    if (!savedDevice) return;
-    void refresh();
-    const timer = setInterval(() => void refresh(), POLL_INTERVAL_MS);
-    return () => clearInterval(timer);
-  }, [refresh, savedDevice]);
+    if (!savedDevice || previewMode) return;
+    const feed = createLiveSync({
+      watch: (revision, signal) => watchRelayChanges(savedDevice, revision, signal), refresh,
+      onError: (error) => { setSyncError(error.message); setConnectionError(error.message); },
+    });
+    const unbind = bindForegroundSync((active) => {
+      if (!active) setSyncError('页面已暂停同步，返回后刷新。');
+      feed.setActive(active);
+    });
+    return () => { unbind(); feed.close(); };
+  }, [refresh, savedDevice, previewMode]);
+
+  const retryRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await refresh();
+    } finally {
+      setRefreshing(false);
+    }
+  }, [refresh]);
+
+  const renewPairing = useCallback(async () => {
+    if (!savedDevice || previewMode || paired) return;
+    setPairingRenewBusy(true);
+    setConnectionError(null);
+    try {
+      const renewal = await renewPairingCode(savedDevice);
+      setPairingCode(renewal.pairing_code);
+      setPairingExpiresAt(renewal.pairing_expires_at);
+      setConnectionNote('已生成新的配对码；旧配对码立即失效。');
+    } catch (error) {
+      if (error instanceof RelayError && error.status === 409) {
+        setConnectionNote('电脑端已完成配对，正在重新确认状态。');
+        await refresh();
+      } else if (error instanceof RelayError && error.status === 429) {
+        setConnectionError('生成配对码太频繁，请稍后再试。');
+      } else if (error instanceof RelayError && error.status === 404) {
+        setConnectionError(
+          '当前 Relay 还不支持刷新配对码，请先在电脑运行 codexy doctor。',
+        );
+      } else {
+        setConnectionError(
+          error instanceof Error ? error.message : '无法生成新的配对码。',
+        );
+      }
+    } finally {
+      setPairingRenewBusy(false);
+    }
+  }, [paired, previewMode, refresh, savedDevice]);
 
   const connect = useCallback(async () => {
+    if (requiresStandaloneInstall()) {
+      setConnectionError(
+        '请先在 Safari 点“分享”→“添加到主屏幕”，再从主屏幕打开 Codexy。',
+      );
+      return;
+    }
     const relayUrl = normalizeRelayUrl(relayInput);
     if (!relayUrl) {
       setConnectionError('请输入 Codexy Relay 地址。');
@@ -545,11 +703,12 @@ export default function App() {
     setConnectionError(null);
     try {
       const push = await registerForPushNotifications();
-      const deviceId = savedDevice?.deviceId ?? createDeviceId();
+      const sameRelay = savedDevice?.relayUrl === relayUrl;
+      const deviceId = sameRelay ? savedDevice.deviceId : createDeviceId();
       const registration = await registerDevice({
         relayUrl,
         deviceId,
-        deviceSecret: savedDevice?.deviceSecret,
+        deviceSecret: sameRelay ? savedDevice.deviceSecret : undefined,
         expoPushToken: push.token,
         platform: Platform.OS,
       });
@@ -562,10 +721,15 @@ export default function App() {
       setSavedDevice(nextDevice);
       setPaired(registration.paired);
       setPairingCode(registration.pairing_code);
+      setPairingExpiresAt(registration.pairing_expires_at);
       setConnectionNote(push.message);
       setSessions([]);
       setEvents([]);
       setCommands([]);
+      setReplySummaryCache({});
+      setSummarizingSessionRef(null);
+      setLastSyncAt(null);
+      setSyncError(null);
       cursorRef.current = 0;
       setCursor(0);
     } catch (error) {
@@ -600,22 +764,34 @@ export default function App() {
           return;
         }
       }
-      await disableWebPush();
+      await disableWebPush(savedDevice);
       setConnecting(false);
     }
+    if (props.onDeviceRemoved) { await props.onDeviceRemoved(); return; }
     await clearAllCodexyStorage();
     setSavedDevice(null);
     setPreviewMode(false);
     setPaired(false);
     setPairingCode(null);
+    setPairingExpiresAt(null);
+    setPairingRenewBusy(false);
     setEvents([]);
     setSessions([]);
+    setHiddenSessionRefs([]);
     setCommands([]);
+    setReplySummaryCache({});
+    setSummarizingSessionRef(null);
     setConnectionError(null);
     setConnectionNote('');
     setLastSyncAt(null);
+    setSyncError(null);
     setNotificationPreferences(DEFAULT_NOTIFICATION_PREFERENCES);
+    setNotificationTestBusy(false);
+    setNotificationTestSent(false);
+    setNotificationTestConfirmed(false);
     setSelectedSessionRef(null);
+    setPendingHiddenSession(null);
+    setResetConfirmationVisible(false);
     setActiveTab('workbench');
     setSessionFilter('all');
     setShowAdvancedRelay(false);
@@ -629,18 +805,7 @@ export default function App() {
       void resetConnection();
       return;
     }
-    Alert.alert(
-      '撤销这台手机？',
-      '电脑端设备凭据、后台推送订阅和本机草稿都会删除。之后需要重新配对。',
-      [
-        { text: '取消', style: 'cancel' },
-        {
-          text: '撤销并断开',
-          style: 'destructive',
-          onPress: () => void resetConnection(),
-        },
-      ],
-    );
+    setResetConfirmationVisible(true);
   }, [previewMode, resetConnection]);
 
   const saveNotificationPreferences = useCallback(
@@ -677,14 +842,94 @@ export default function App() {
   const activateWebPush = useCallback(async () => {
     if (!savedDevice || previewMode) return;
     setWebPushBusy(true);
-    const status = await enableWebPush({
-      relayUrl: savedDevice.relayUrl,
-      deviceId: savedDevice.deviceId,
-      deviceSecret: savedDevice.deviceSecret,
-    });
-    setWebPushStatus(status);
-    setConnectionNote(status.detail);
-    setWebPushBusy(false);
+    setConnectionError(null);
+    try {
+      const status = await enableWebPush({
+        relayUrl: savedDevice.relayUrl,
+        deviceId: savedDevice.deviceId,
+        deviceSecret: savedDevice.deviceSecret,
+      });
+      setWebPushStatus(status);
+      setConnectionNote(status.detail);
+      if (status.phase === 'subscribed') {
+        setNotificationTestSent(false);
+        setNotificationTestConfirmed(false);
+        await saveNotificationTestConfirmed(savedDevice, false);
+      }
+    } catch (error) {
+      setConnectionError(
+        error instanceof Error ? error.message : '无法启用后台通知。',
+      );
+    } finally {
+      setWebPushBusy(false);
+    }
+  }, [previewMode, savedDevice]);
+
+  const testNotification = useCallback(async () => {
+    if (previewMode) {
+      setNotificationTestSent(true);
+      setConnectionNote('体验模式只演示通知流程，不会发送真实系统通知。');
+      return;
+    }
+    if (!savedDevice || webPushStatus.phase !== 'subscribed') return;
+    setNotificationTestBusy(true);
+    setConnectionError(null);
+    try {
+      const result = await sendTestNotification(savedDevice);
+      if (!result.delivered) {
+        const subscriptionExpired =
+          result.delivery_status === 'expired' ||
+          result.push_channels.web === 'expired';
+        let detail =
+          result.delivery_status === 'not_configured'
+            ? 'Relay 尚未配置可用的推送通道，请在电脑运行 codexy doctor。'
+            : '测试通知发送失败，请稍后重试或在电脑运行 codexy doctor。';
+        if (subscriptionExpired) {
+          const recoveryStatus = await resetExpiredWebPush(savedDevice);
+          setWebPushStatus(recoveryStatus);
+          setNotificationTestConfirmed(false);
+          await saveNotificationTestConfirmed(savedDevice, false);
+          detail = recoveryStatus.detail;
+        }
+        setNotificationTestSent(false);
+        setConnectionError(detail);
+        return;
+      }
+      setNotificationTestSent(true);
+      setNotificationTestConfirmed(false);
+      await saveNotificationTestConfirmed(savedDevice, false);
+      setConnectionNote(
+        result.delivery_status === 'partial'
+          ? '测试通知已从一个可用通道发出；看到系统横幅后，请确认收到。'
+          : '测试通知已发出；看到系统横幅后，请确认收到。',
+      );
+    } catch (error) {
+      setNotificationTestSent(false);
+      setConnectionError(
+        error instanceof RelayError && error.status === 429
+          ? '测试太频繁，请稍后再试。'
+          : error instanceof Error
+            ? error.message
+            : '无法发送测试通知。',
+      );
+    } finally {
+      setNotificationTestBusy(false);
+    }
+  }, [previewMode, savedDevice, webPushStatus.phase]);
+
+  const confirmNotificationTest = useCallback(async () => {
+    try {
+      if (!previewMode && savedDevice) {
+        await saveNotificationTestConfirmed(savedDevice, true);
+      }
+      setNotificationTestConfirmed(true);
+      setConnectionError(null);
+      setConnectionNote('通知链路已验证；之后可以放心把 Codex 放到后台。');
+    } catch (error) {
+      setConnectionError(
+        error instanceof Error ? error.message : '无法保存通知确认状态。',
+      );
+    }
   }, [previewMode, savedDevice]);
 
   const acknowledge = useCallback(
@@ -781,14 +1026,13 @@ export default function App() {
         return command;
       }
       if (!savedDevice) throw new RelayError('尚未连接 Codexy Relay。');
-      const command = await sendRemotePrompt({
+      const command = await reviewedPromptSender.submit({
         relayUrl: savedDevice.relayUrl,
         deviceId: savedDevice.deviceId,
         deviceSecret: savedDevice.deviceSecret,
         sessionRef: session.session_ref,
         prompt,
         mode,
-        idempotencyKey: createCommandKey(),
       });
       setCommands((current) => [
         command,
@@ -862,14 +1106,25 @@ export default function App() {
 
   const loadReplySummaryForSession = useCallback(
     async (session: AgentSession): Promise<CodexReplySummary> => {
-      if (previewMode) return previewReplySummary(session);
-      if (!savedDevice) throw new RelayError('尚未连接 Codexy Relay。');
-      return getSessionReplySummary({
-        relayUrl: savedDevice.relayUrl,
-        deviceId: savedDevice.deviceId,
-        deviceSecret: savedDevice.deviceSecret,
-        sessionRef: session.session_ref,
-      });
+      const summary = previewMode
+        ? previewReplySummary(session)
+        : savedDevice
+          ? await getSessionReplySummary({
+              relayUrl: savedDevice.relayUrl,
+              deviceId: savedDevice.deviceId,
+              deviceSecret: savedDevice.deviceSecret,
+              sessionRef: session.session_ref,
+            })
+          : null;
+      if (!summary) throw new RelayError('尚未连接 Codexy Relay。');
+      setReplySummaryCache((current) => ({
+        ...current,
+        [session.session_ref]: {
+          sessionUpdatedAt: `${session.updated_at}:${session.state}`,
+          summary,
+        },
+      }));
+      return summary;
     },
     [previewMode, savedDevice],
   );
@@ -1027,7 +1282,7 @@ export default function App() {
         state: 'turn_finished',
         summary: '移动端本轮界面调整已经结束。',
         updated_at: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
-        control_status: 'observe_only',
+        control_status: 'ready',
         prompt_count: 3,
         prompts: [
           {
@@ -1049,12 +1304,26 @@ export default function App() {
       },
     ];
     previewControlsRef.current.clear();
+    setReplySummaryCache(
+      Object.fromEntries(
+        previewSessions.map((session) => [
+          session.session_ref,
+          {
+            sessionUpdatedAt: `${session.updated_at}:${session.state}`,
+            summary: previewReplySummary(session),
+          },
+        ]),
+      ),
+    );
+    setSummarizingSessionRef(null);
     previewControlsRef.current.set(
       previewSessions[0].session_ref,
       previewControlSnapshot(previewSessions[0]),
     );
     setPreviewMode(true);
     setPaired(true);
+    setPairingCode(null);
+    setPairingExpiresAt(null);
     setSessions(previewSessions);
     setEvents(
       previewSessions.map((session, index) => ({
@@ -1079,7 +1348,10 @@ export default function App() {
     });
     setConnectionNote('本地体验模式不会连接或上传任何 Codex 数据。');
     setLastSyncAt(Date.now());
+    setSyncError(null);
     setNotificationPreferences(DEFAULT_NOTIFICATION_PREFERENCES);
+    setNotificationTestSent(false);
+    setNotificationTestConfirmed(true);
     setConnectionError(null);
     setActiveTab('workbench');
   }, []);
@@ -1118,12 +1390,75 @@ export default function App() {
     setConnectionNote('已模拟一条 Codex 手机推送。');
   }, [cursor]);
 
+  const hideSessionFromWorkbench = useCallback((session: AgentSession) => {
+    setPendingHiddenSession(session);
+  }, []);
+
+  const confirmHideSession = useCallback(async () => {
+    if (!pendingHiddenSession) return;
+    const session = pendingHiddenSession;
+    if (hiddenSessionRefs.includes(session.session_ref)) {
+      setPendingHiddenSession(null);
+      return;
+    }
+    const next = [...hiddenSessionRefs, session.session_ref];
+    try {
+      const persisted = await saveHiddenSessionRefs(next, storageScope);
+      setHiddenSessionRefs(persisted);
+      setPendingHiddenSession(null);
+      setConnectionError(null);
+      setConnectionNote(
+        `已隐藏 ${session.project_alias}。会话仍在电脑运行；若它需要你或运行失败，会重新出现在注意力队列。`,
+      );
+    } catch (error) {
+      setConnectionError(
+        error instanceof Error
+          ? `无法保存隐藏偏好：${error.message}`
+          : '无法保存隐藏偏好。',
+      );
+    }
+  }, [hiddenSessionRefs, pendingHiddenSession]);
+
+  const restoreHiddenSessions = useCallback(async () => {
+    try {
+      const persisted = await saveHiddenSessionRefs([], storageScope);
+      setHiddenSessionRefs(persisted);
+      setConnectionError(null);
+      setConnectionNote('已恢复所有隐藏会话。');
+    } catch (error) {
+      setConnectionError(
+        error instanceof Error
+          ? `无法恢复隐藏会话：${error.message}`
+          : '无法恢复隐藏会话。',
+      );
+    }
+  }, []);
+
+  const restoreHiddenSession = useCallback(
+    async (sessionRef: string) => {
+      const next = hiddenSessionRefs.filter((item) => item !== sessionRef);
+      try {
+        const persisted = await saveHiddenSessionRefs(next, storageScope);
+        setHiddenSessionRefs(persisted);
+        setConnectionError(null);
+        setConnectionNote('已恢复这条会话。');
+      } catch (error) {
+        setConnectionError(
+          error instanceof Error
+            ? `无法恢复隐藏会话：${error.message}`
+            : '无法恢复隐藏会话。',
+        );
+      }
+    },
+    [hiddenSessionRefs],
+  );
+
   const orderedSessions = useMemo(
     () =>
       [...sessions].sort((left, right) => {
-        const leftUrgent = left.state === 'needs_you' ? 1 : 0;
-        const rightUrgent = right.state === 'needs_you' ? 1 : 0;
-        if (leftUrgent !== rightUrgent) return rightUrgent - leftUrgent;
+        const priorityDifference =
+          attentionPriorityFor(right) - attentionPriorityFor(left);
+        if (priorityDifference !== 0) return priorityDifference;
         return (
           new Date(right.updated_at).getTime() -
           new Date(left.updated_at).getTime()
@@ -1131,26 +1466,77 @@ export default function App() {
       }),
     [sessions],
   );
-  const urgentSession =
-    orderedSessions.find((session) => session.state === 'needs_you') ?? null;
-  const urgentCount = orderedSessions.filter(
-    (session) =>
-      session.state === 'needs_you',
-  ).length;
-  const controllableCount = orderedSessions.filter(
-    (session) => session.control_status === 'ready',
-  ).length;
-  const reviewSession =
-    orderedSessions.find((session) =>
-      ['turn_finished', 'subtask_completed', 'completed', 'failed'].includes(
-        session.state,
+  const hiddenSessionSet = useMemo(
+    () => new Set(hiddenSessionRefs),
+    [hiddenSessionRefs],
+  );
+  const visibleOrderedSessions = useMemo(
+    () => visibleSessionTracks(orderedSessions, hiddenSessionSet),
+    [hiddenSessionSet, orderedSessions],
+  );
+  const hiddenSessions = useMemo(
+    () =>
+      orderedSessions.filter((session) =>
+        hiddenSessionSet.has(session.session_ref),
       ),
-    ) ?? null;
+    [hiddenSessionSet, orderedSessions],
+  );
+  const attentionEligibleSessions = useMemo(
+    () =>
+      filterAttentionEligibleSessions(
+        orderedSessions,
+        hiddenSessionSet,
+      ),
+    [hiddenSessionSet, orderedSessions],
+  );
+  const dashboardSummaries = useMemo(() => {
+    const summaries: Record<string, CodexReplySummary> = {};
+    for (const session of orderedSessions) {
+      const cached = replySummaryCache[session.session_ref];
+      if (cached?.sessionUpdatedAt === `${session.updated_at}:${session.state}`) {
+        summaries[session.session_ref] = cached.summary;
+      }
+    }
+    return summaries;
+  }, [orderedSessions, replySummaryCache]);
+  const attentionQueue = useMemo(
+    () => buildAttentionQueue(attentionEligibleSessions, dashboardSummaries),
+    [attentionEligibleSessions, dashboardSummaries],
+  );
+  const summarizeFromWorkbench = useCallback(
+    async (sessionRef: string) => {
+      const session = orderedSessions.find(
+        (candidate) => candidate.session_ref === sessionRef,
+      );
+      if (!session) return;
+      setSummarizingSessionRef(sessionRef);
+      setConnectionError(null);
+      try {
+        const summary = await loadReplySummaryForSession(session);
+        setConnectionNote(
+          summary.available
+            ? '已在电脑本机提炼最新回复；完整回复没有进入手机持久状态。'
+            : '当前还没有可提炼的最终回复；完成本轮后可以再试。',
+        );
+      } catch (error) {
+        setConnectionError(
+          error instanceof Error
+            ? error.message
+            : '无法提炼这条 Agent 回复。',
+        );
+      } finally {
+        setSummarizingSessionRef(null);
+      }
+    },
+    [loadReplySummaryForSession, orderedSessions],
+  );
+
+  const primaryAttention = attentionQueue[0] ?? null;
   const filteredSessions = useMemo(
     () =>
-      orderedSessions.filter((session) => {
+      visibleOrderedSessions.filter((session) => {
         if (sessionFilter === 'attention') {
-          return session.state === 'needs_you';
+          return attentionPriorityFor(session) > 0;
         }
         if (sessionFilter === 'running') return session.state === 'working';
         if (sessionFilter === 'review') {
@@ -1163,32 +1549,61 @@ export default function App() {
         }
         return true;
       }),
-    [orderedSessions, sessionFilter],
+    [sessionFilter, visibleOrderedSessions],
   );
   const filterCounts: Record<SessionFilter, number> = {
-    all: orderedSessions.length,
-    attention: urgentCount,
-    running: orderedSessions.filter((session) => session.state === 'working')
-      .length,
-    review: orderedSessions.filter((session) =>
+    all: visibleOrderedSessions.length,
+    attention: attentionQueue.length,
+    running: visibleOrderedSessions.filter(
+      (session) => session.state === 'working',
+    ).length,
+    review: visibleOrderedSessions.filter((session) =>
       ['turn_finished', 'subtask_completed', 'completed', 'failed'].includes(
         session.state,
       ),
     ).length,
   };
+  const syncSnapshotTrusted =
+    previewMode || (lastSyncAt !== null && syncError === null);
+  const syncStatusUnknown = !syncSnapshotTrusted;
+  const lastSuccessfulSyncLabel = lastSyncAt
+    ? formatSyncTimestamp(lastSyncAt)
+    : '尚无成功同步记录';
+  const pairingExpiry = pairingExpiryStatus(pairingExpiresAt);
   const setupChecks = [
     {
-      done: Boolean(savedDevice) || previewMode,
+      done:
+        previewMode || (syncSnapshotTrusted && Boolean(savedDevice)),
       label: '手机已连接 Relay',
-    },
-    { done: paired || previewMode, label: '桌面已完成配对' },
-    {
-      done: previewMode || webPushStatus.phase === 'subscribed',
-      label: '后台通知已启用',
+      unknown: syncStatusUnknown,
     },
     {
-      done: previewMode || remoteControl.state === 'ready',
+      done: previewMode || (syncSnapshotTrusted && paired),
+      label: '桌面已完成配对',
+      unknown: syncStatusUnknown,
+    },
+    {
+      done:
+        previewMode ||
+        (syncSnapshotTrusted && webPushStatus.phase === 'subscribed'),
+      label: '后台通知已订阅',
+      unknown: syncStatusUnknown,
+    },
+    {
+      done:
+        previewMode ||
+        (syncSnapshotTrusted &&
+          webPushStatus.phase === 'subscribed' &&
+          notificationTestConfirmed),
+      label: '测试通知已确认',
+      unknown: syncStatusUnknown,
+    },
+    {
+      done:
+        previewMode ||
+        (syncSnapshotTrusted && remoteControl.state === 'ready'),
       label: '手机 Prompt 已就绪',
+      unknown: syncStatusUnknown,
     },
   ];
   const setupCompleteCount = setupChecks.filter((step) => step.done).length;
@@ -1200,11 +1615,12 @@ export default function App() {
     : null;
   const connectionLabel = previewMode
     ? '体验'
-    : connectionError
-      ? '离线'
+    : syncError
+      ? '状态未知'
       : secondsSinceSync === null
-        ? '连接中'
+        ? '同步中'
         : `在线 · ${secondsSinceSync} 秒前`;
+  const standaloneInstallRequired = requiresStandaloneInstall();
   const selectedSession =
     orderedSessions.find(
       (session) => session.session_ref === selectedSessionRef,
@@ -1265,24 +1681,35 @@ export default function App() {
             </View>
             <Text style={styles.setupTitle}>把 Codex 放进口袋</Text>
             <Text style={styles.setupDescription}>
-              一个专为并行 Codex CLI 设计的手机工作台：先分清哪条线需要你，再继续输入。
+              在手机上只看需要你处理的 Codex，并继续下一轮。
             </Text>
 
-            <View style={styles.featureList}>
-              <Text style={styles.featureItem}>01 · 多个 CLI 一眼分清轻重缓急</Text>
-              <Text style={styles.featureItem}>02 · Queue 默认安全，Steer 只用于纠偏</Text>
-              <Text style={styles.featureItem}>03 · 最近 10 条脱敏 Prompt 恢复上下文</Text>
-              <Text style={styles.featureItem}>04 · 本地整理目标、约束、决定与未决问题</Text>
-            </View>
-
             <View style={styles.setupPromiseCard}>
-              <Text style={styles.setupPromiseEyebrow}>FIRST RUN · 约 2 分钟</Text>
-              <Text style={styles.setupPromiseTitle}>这台电脑已经被找到</Text>
-              <Text selectable style={styles.setupPromiseUrl}>
-                {relayInput}
+              <Text style={styles.setupPromiseEyebrow}>
+                {standaloneInstallRequired
+                  ? 'IPHONE · 连接前完成'
+                  : '准备连接'}
               </Text>
+              <Text style={styles.setupPromiseTitle}>
+                {standaloneInstallRequired
+                  ? '先把 Codexy 添加到主屏幕'
+                  : '这台电脑已经被找到'}
+              </Text>
+              {standaloneInstallRequired ? (
+                <Text style={styles.setupInstallSteps}>
+                  1. 在 Safari 点“分享”{'\n'}
+                  2. 选择“添加到主屏幕”{'\n'}
+                  3. 从主屏幕的新图标重新打开 Codexy
+                </Text>
+              ) : (
+                <Text selectable style={styles.setupPromiseUrl}>
+                  {relayInput}
+                </Text>
+              )}
               <Text style={styles.setupPromiseBody}>
-                连接后只需在电脑确认一次配对，再在手机启用通知。
+                {standaloneInstallRequired
+                  ? '装好后再连接，避免重复绑定。'
+                  : '连接后在电脑确认一次即可。'}
               </Text>
             </View>
 
@@ -1320,7 +1747,11 @@ export default function App() {
               {connecting ? (
                 <ActivityIndicator color="#FFFFFF" />
               ) : (
-                <Text style={styles.primaryButtonText}>一键连接这台电脑</Text>
+                <Text style={styles.primaryButtonText}>
+                  {standaloneInstallRequired
+                    ? '先添加到主屏幕'
+                    : '连接这台电脑'}
+                </Text>
               )}
             </Pressable>
 
@@ -1330,7 +1761,7 @@ export default function App() {
               style={styles.advancedButton}
             >
               <Text style={styles.advancedButtonText}>
-                {showAdvancedRelay ? '收起高级设置' : '地址不对？手动填写 Relay'}
+                {showAdvancedRelay ? '收起地址' : '手动填写地址'}
               </Text>
             </Pressable>
 
@@ -1339,14 +1770,12 @@ export default function App() {
               onPress={startPreview}
               style={styles.previewButton}
             >
-              <Text style={styles.previewButtonText}>先用演示数据体验</Text>
+              <Text style={styles.previewButtonText}>先看看演示</Text>
               <Text style={styles.previewButtonMeta}>不连接电脑 · 不上传数据</Text>
             </Pressable>
 
             <Text style={styles.setupPrivacy}>
-              Codexy 只按需读取最近一次最终回复，并先在电脑端过滤敏感内容；
-              完整回复、代码和工具日志不会进入推送或持久状态。Codexy 是非官方
-              Codex CLI 伴侣。
+              私有连接 · 不同步完整回复 · 非官方 Codex CLI 伴侣
             </Text>
           </ScrollView>
         </KeyboardAvoidingView>
@@ -1363,6 +1792,10 @@ export default function App() {
     );
     return (
       <CodexSessionScreen
+        key={selectedSession.session_ref}
+        initialReplySummary={
+          dashboardSummaries[selectedSession.session_ref]
+        }
         latestCommand={
           commands.find(
             (command) =>
@@ -1373,8 +1806,17 @@ export default function App() {
           if (pendingEvent) void acknowledge(pendingEvent);
         }}
         onCancelPrompt={cancelPromptCommand}
-        onClose={() => setSelectedSessionRef(null)}
+        onClose={() => props.onExit ? props.onExit() : setSelectedSessionRef(null)}
         onLoadControl={() => loadControlForSession(selectedSession)}
+        runtimeRevision={lastSyncAt ?? 0}
+        onLoadRuntime={() => {
+          if (!savedDevice || previewMode) return Promise.resolve({ session_ref: selectedSession.session_ref, context: null, weekly: null, goal_available: false, goal: null, refreshed_at: new Date().toISOString() });
+          return getSessionRuntime(savedDevice, selectedSession.session_ref);
+        }}
+        onUpdateGoal={(input) => {
+          if (!savedDevice || previewMode) return Promise.reject(new Error('请连接真实电脑后设置 Goal。'));
+          return updateSessionGoal(savedDevice, selectedSession.session_ref, input);
+        }}
         onLoadReplySummary={() =>
           loadReplySummaryForSession(selectedSession)
         }
@@ -1391,8 +1833,8 @@ export default function App() {
             reasoningEffort,
           )
         }
-        online={previewMode || !connectionError}
-        session={selectedSession}
+        online={previewMode || (lastSyncAt !== null && !syncError && Date.now() - lastSyncAt < FRESHNESS_MS)}
+        session={{ ...selectedSession, host_label: props.initialDevice?.label, storage_scope: storageScope }}
       />
     );
   }
@@ -1404,11 +1846,7 @@ export default function App() {
         contentContainerStyle={styles.content}
         refreshControl={
           <RefreshControl
-            onRefresh={async () => {
-              setRefreshing(true);
-              await refresh();
-              setRefreshing(false);
-            }}
+            onRefresh={retryRefresh}
             refreshing={refreshing}
             tintColor="#111111"
           />
@@ -1423,14 +1861,13 @@ export default function App() {
             />
             <View>
               <Text style={styles.brand}>Codexy</Text>
-              <Text style={styles.tagline}>CODEX, WHEREVER YOU ARE</Text>
             </View>
           </View>
           <View style={styles.connectionPill}>
             <View
               style={[
                 styles.connectionDot,
-                connectionError && styles.connectionDotError,
+                syncStatusUnknown && styles.connectionDotUnknown,
               ]}
             />
             <Text style={styles.connectionPillText}>
@@ -1441,114 +1878,164 @@ export default function App() {
 
         {activeTab === 'workbench' ? (
           <>
-            <Text style={styles.screenEyebrow}>CODEX WORKBENCH</Text>
+            <Text style={styles.screenEyebrow}>现在</Text>
             <Text style={styles.screenTitle}>
-              {urgentCount
-                ? `现在只需要处理 ${urgentCount} 件事`
-                : '现在没有事情需要你'}
+              {syncStatusUnknown
+                ? syncError
+                  ? '当前 Codex 状态未知'
+                  : '正在确认 Codex 状态'
+                : primaryAttention
+                  ? `先处理 ${primaryAttention.projectAlias}`
+                  : '现在不用管 Codex'}
             </Text>
-            <Text style={styles.screenLead}>
-              {urgentCount
-                ? `${filterCounts.running} 个 Codex 仍在工作。先处理等待你的，再给已结束的会话接下一棒。`
-                : `${filterCounts.running} 个 Codex 仍在工作。可以先放下手机；需要决定时 Codexy 会叫你。`}
+            <Text style={styles.workbenchSummary}>
+              {syncStatusUnknown
+                ? lastSyncAt
+                  ? `状态停留在 ${lastSuccessfulSyncLabel}，请重新同步`
+                  : '还没有拿到可靠状态'
+                : primaryAttention
+                  ? `${attentionQueue.length} 项待处理 · ${filterCounts.running} 个运行中 · ${visibleOrderedSessions.length} 条会话`
+                  : `${filterCounts.running} 个运行中 · ${visibleOrderedSessions.length} 条会话`}
             </Text>
 
-            <View style={styles.metrics}>
-              <Metric label="会话" value={String(orderedSessions.length)} />
-              <Metric
-                label="手机可控"
-                value={String(controllableCount)}
-              />
-              <Metric
-                label="需要你"
-                urgent={Boolean(urgentSession)}
-                value={String(urgentCount)}
-              />
-            </View>
-
-            {!previewMode && !paired && pairingCode ? (
+            {!syncStatusUnknown &&
+            !previewMode &&
+            !paired &&
+            savedDevice ? (
               <View style={styles.pairingCard}>
-                <Text style={styles.pairingStep}>SETUP · 2/4</Text>
-                <Text style={styles.pairingLabel}>还差一步：在电脑确认</Text>
-                <Text selectable style={styles.pairingCode}>
-                  {pairingCode}
+                <Text style={styles.pairingStep}>SETUP · 2/5</Text>
+                <Text style={styles.pairingLabel}>
+                  {pairingExpiry.expired || !pairingCode
+                    ? '需要新的配对码'
+                    : '还差一步：在电脑确认'}
                 </Text>
-                <Text style={styles.pairingBody}>
-                  在 Codexy 工程运行下面这一条：{'\n'}
-                  npm.cmd run relay:claim --{' '}
-                  {pairingCode}
-                </Text>
+                {!pairingExpiry.expired && pairingCode ? (
+                  <>
+                    <Text selectable style={styles.pairingCode}>
+                      {pairingCode}
+                    </Text>
+                    <Text style={styles.pairingBody}>
+                      在电脑的任意终端运行：
+                    </Text>
+                    <Text selectable style={styles.pairingCommand}>
+                      codexy pair {pairingCode}
+                    </Text>
+                  </>
+                ) : (
+                  <Text style={styles.pairingBody}>
+                    生成新码后，再到电脑终端完成确认。无需重新连接手机。
+                  </Text>
+                )}
                 <Text style={styles.pairingHint}>
-                  配对码 10 分钟后失效；它只绑定这一台手机。
+                  {pairingExpiry.label}；配对码只绑定这一台手机。
                 </Text>
+                {pairingExpiry.expired || !pairingCode ? (
+                  <SpringPressable
+                    accessibilityRole="button"
+                    disabled={pairingRenewBusy}
+                    onPress={() => void renewPairing()}
+                    style={[
+                      styles.pairingRenewButton,
+                      pairingRenewBusy && styles.buttonDisabled,
+                    ]}
+                  >
+                    {pairingRenewBusy ? (
+                      <ActivityIndicator color="#111111" />
+                    ) : (
+                      <Text style={styles.pairingRenewButtonText}>
+                        生成新配对码
+                      </Text>
+                    )}
+                  </SpringPressable>
+                ) : null}
               </View>
             ) : null}
 
-            {connectionNote ? (
+            {connectionNote && !previewMode ? (
               <Text style={styles.connectionNote}>{connectionNote}</Text>
             ) : null}
-            {connectionError ? (
+            {connectionError && connectionError !== syncError ? (
               <Text accessibilityRole="alert" style={styles.errorText}>
                 {connectionError}
               </Text>
             ) : null}
 
-            {urgentSession ? (
-              <Pressable
-                accessibilityRole="button"
-                onPress={() =>
-                  setSelectedSessionRef(urgentSession.session_ref)
-                }
-                style={styles.urgentCard}
+            {syncStatusUnknown ? (
+              <View
+                accessibilityLiveRegion="assertive"
+                style={styles.syncUnknownCard}
               >
-                <Text style={styles.urgentEyebrow}>CODEX NEEDS YOU</Text>
-                <Text style={styles.urgentTitle}>
-                  {urgentSession.project_alias}
+                <Text style={styles.syncUnknownEyebrow}>
+                  {syncError ? 'SYNC UNKNOWN' : 'FIRST SYNC'}
                 </Text>
-                <Text style={styles.urgentBody}>{urgentSession.summary}</Text>
-                <Text style={styles.urgentAction}>现在处理 →</Text>
-              </Pressable>
-            ) : reviewSession ? (
-              <Pressable
-                accessibilityRole="button"
-                onPress={() =>
-                  setSelectedSessionRef(reviewSession.session_ref)
-                }
-                style={styles.reviewReadyCard}
-              >
-                <Text style={styles.reviewReadyEyebrow}>NEXT BEST ACTION</Text>
-                <Text style={styles.reviewReadyTitle}>
-                  {reviewSession.project_alias} 有结果可复核
+                <Text style={styles.syncUnknownTitle}>
+                  {syncError
+                    ? '暂时无法确认是否需要你'
+                    : '正在获取可信状态'}
                 </Text>
-                <Text style={styles.reviewReadyBody}>
-                  {reviewSession.summary}
+                <Text style={styles.syncUnknownBody}>
+                  上次成功同步：{lastSuccessfulSyncLabel}。
+                  {lastSyncAt
+                    ? ' 下方会话仅是当时的快照，当前状态可能已经变化。'
+                    : ' 在首次成功同步前，Codexy 不会显示注意力已清空。'}
                 </Text>
-                <Text style={styles.reviewReadyAction}>打开本轮结果 →</Text>
-              </Pressable>
-            ) : orderedSessions.some((session) => session.state === 'working') ? (
-              <View style={styles.quietCard}>
-                <Text style={styles.quietEyebrow}>ALL CLEAR</Text>
-                <Text style={styles.quietTitle}>现在没有事情需要你</Text>
-                <Text style={styles.quietBody}>
-                  Codex 正在工作。可以先放下手机；需要决定时 Codexy 会叫你。
-                </Text>
+                {syncError ? (
+                  <Text accessibilityRole="alert" style={styles.syncErrorDetail}>
+                    {syncError}
+                  </Text>
+                ) : null}
+                <SpringPressable
+                  accessibilityRole="button"
+                  accessibilityState={{ busy: refreshing, disabled: refreshing }}
+                  disabled={refreshing}
+                  onPress={() => void retryRefresh()}
+                  style={[
+                    styles.syncRetryButton,
+                    refreshing && styles.buttonDisabled,
+                  ]}
+                >
+                  {refreshing ? (
+                    <ActivityIndicator color="#FFFFFF" />
+                  ) : (
+                    <Text style={styles.syncRetryButtonText}>重新同步</Text>
+                  )}
+                </SpringPressable>
               </View>
-            ) : null}
+            ) : (
+              <AttentionQueue
+                items={attentionQueue}
+                onOpen={setSelectedSessionRef}
+                onSummarize={(sessionRef) =>
+                  void summarizeFromWorkbench(sessionRef)
+                }
+                summarizingSessionRef={summarizingSessionRef}
+                workingCount={filterCounts.running}
+              />
+            )}
 
             <View style={styles.sectionHeading}>
-              <Text style={styles.sectionLabel}>会话轨道</Text>
-              <Text style={styles.sectionMeta}>最近 24 小时</Text>
+              <Text style={styles.sectionLabel}>
+                {attentionQueue.length ? '其他会话' : '会话'}
+              </Text>
+              <Text style={styles.sectionMeta}>
+                {syncStatusUnknown
+                  ? lastSyncAt
+                    ? `上次快照 · ${lastSuccessfulSyncLabel}`
+                    : '等待可信快照'
+                  : `${visibleOrderedSessions.length} 条 · 最近 24 小时`}
+              </Text>
             </View>
 
             <View accessibilityRole="tablist" style={styles.filterRow}>
               {SESSION_FILTERS.map((filter) => {
                 const selected = sessionFilter === filter.id;
                 return (
-                  <Pressable
+                  <SpringPressable
                     accessibilityRole="tab"
                     accessibilityState={{ selected }}
                     key={filter.id}
                     onPress={() => setSessionFilter(filter.id)}
+                    pressedScale={0.97}
                     style={[
                       styles.filterButton,
                       selected && styles.filterButtonSelected,
@@ -1560,9 +2047,10 @@ export default function App() {
                         selected && styles.filterButtonTextSelected,
                       ]}
                     >
-                      {filter.label} {filterCounts[filter.id]}
+                      {filter.label}{' '}
+                      {syncStatusUnknown ? '—' : filterCounts[filter.id]}
                     </Text>
-                  </Pressable>
+                  </SpringPressable>
                 );
               })}
             </View>
@@ -1573,9 +2061,11 @@ export default function App() {
                   <CodexSessionCard
                     index={index}
                     key={session.session_ref}
+                    onHide={() => hideSessionFromWorkbench(session)}
                     onPress={() =>
                       setSelectedSessionRef(session.session_ref)
                     }
+                    replySummary={dashboardSummaries[session.session_ref]}
                     session={session}
                   />
                 ))}
@@ -1583,14 +2073,22 @@ export default function App() {
             ) : (
               <View style={styles.emptyCard}>
                 <Text style={styles.emptyTitle}>
-                  {orderedSessions.length
+                  {syncStatusUnknown
+                    ? '会话列表尚未确认'
+                    : visibleOrderedSessions.length
                     ? '这个分组暂时是空的'
-                    : '等待第一个 Codex 会话'}
+                    : hiddenSessionRefs.length
+                      ? '会话轨道已整理干净'
+                      : '等待第一个 Codex 会话'}
                 </Text>
                 <Text style={styles.emptyBody}>
-                  {orderedSessions.length
+                  {syncStatusUnknown
+                    ? '网络恢复并同步成功后，这里才会确认当前会话轨道。'
+                    : visibleOrderedSessions.length
                     ? '切换到“全部”查看其他会话。'
-                    : '用 codexy 打开一个项目并发送 Prompt 后，这里会出现一条独立轨道。'}
+                    : hiddenSessionRefs.length
+                      ? `已隐藏 ${hiddenSessionRefs.length} 条会话；可在“设置 → 已隐藏会话”中恢复。`
+                      : '用 codexy 打开一个项目并发送 Prompt 后，这里会出现一条独立轨道。'}
                 </Text>
               </View>
             )}
@@ -1607,14 +2105,6 @@ export default function App() {
               </Pressable>
             ) : null}
 
-            <View style={styles.ideaCard}>
-              <Text style={styles.ideaEyebrow}>PROMPT → INTENT</Text>
-              <Text style={styles.ideaTitle}>不是保存聊天，而是保存方向</Text>
-              <Text style={styles.ideaBody}>
-                每条轨道只保留最近十条脱敏用户指令，用来整理当前目标、关键约束、已做决定、未决问题和建议的下一条
-                Prompt；完整回复和代码不进入这条通道。
-              </Text>
-            </View>
           </>
         ) : (
           <>
@@ -1627,7 +2117,9 @@ export default function App() {
             <View style={styles.setupJourneyHeading}>
               <Text style={styles.settingsSectionLabel}>上手进度</Text>
               <Text style={styles.setupJourneyCount}>
-                {setupCompleteCount}/4
+                {syncStatusUnknown
+                  ? '待重新确认'
+                  : `${setupCompleteCount}/5`}
               </Text>
             </View>
             <View style={styles.setupJourney}>
@@ -1639,7 +2131,11 @@ export default function App() {
                       step.done && styles.setupJourneyIndexDone,
                     ]}
                   >
-                    {step.done ? '✓' : String(index + 1).padStart(2, '0')}
+                    {step.unknown
+                      ? '?'
+                      : step.done
+                        ? '✓'
+                        : String(index + 1).padStart(2, '0')}
                   </Text>
                   <Text
                     style={[
@@ -1648,6 +2144,7 @@ export default function App() {
                     ]}
                   >
                     {step.label}
+                    {step.unknown ? ' · 待同步确认' : ''}
                   </Text>
                 </View>
               ))}
@@ -1666,28 +2163,107 @@ export default function App() {
               <View style={styles.settingsRow}>
                 <Text style={styles.settingsLabel}>桌面配对</Text>
                 <Text style={styles.settingsValue}>
-                  {previewMode ? '不需要' : paired ? '已完成' : '等待配对'}
+                  {syncStatusUnknown
+                    ? '待重新确认'
+                    : previewMode
+                      ? '不需要'
+                      : paired
+                        ? '已完成'
+                        : '等待配对'}
                 </Text>
               </View>
               <View style={styles.settingsRow}>
                 <Text style={styles.settingsLabel}>最近同步</Text>
-                <Text style={styles.settingsValue}>{connectionLabel}</Text>
+                <Text style={styles.settingsValue}>
+                  {syncStatusUnknown
+                    ? lastSyncAt
+                      ? `状态未知 · 上次成功 ${lastSuccessfulSyncLabel}`
+                      : '状态未知 · 尚无成功记录'
+                    : connectionLabel}
+                </Text>
               </View>
               <View style={styles.settingsRow}>
                 <Text style={styles.settingsLabel}>手机控制</Text>
                 <Text style={styles.settingsValue}>
-                  {
-                    {
-                      disabled: '未启用',
-                      starting: '连接中',
-                      ready: '已就绪',
-                      error: '异常',
-                    }[remoteControl.state]
-                  }
+                  {syncStatusUnknown
+                    ? '待重新确认'
+                    : {
+                        disabled: '未启用',
+                        starting: '连接中',
+                        ready: '已就绪',
+                        error: '异常',
+                      }[remoteControl.state]}
                 </Text>
               </View>
             </View>
-            <Text style={styles.settingsDetail}>{remoteControl.detail}</Text>
+            <Text style={styles.settingsDetail}>
+              {syncStatusUnknown
+                ? '当前没有可信的最新状态；重新同步前不会沿用旧结果宣称设置已完成。'
+                : remoteControl.detail}
+            </Text>
+            {syncStatusUnknown ? (
+              <SpringPressable
+                accessibilityRole="button"
+                disabled={refreshing}
+                onPress={() => void retryRefresh()}
+                style={[
+                  styles.compactButton,
+                  refreshing && styles.buttonDisabled,
+                ]}
+              >
+                {refreshing ? (
+                  <ActivityIndicator color="#FFFFFF" />
+                ) : (
+                  <Text style={styles.compactButtonText}>重新同步连接状态</Text>
+                )}
+              </SpringPressable>
+            ) : null}
+
+            <Text style={styles.settingsSectionLabel}>已隐藏会话</Text>
+            <View style={styles.settingsCard}>
+              <View style={styles.settingsCardHeading}>
+                <Text style={styles.settingsCardTitle}>
+                  {hiddenSessionRefs.length
+                    ? `${hiddenSessionRefs.length} 条已隐藏`
+                    : '工作台没有隐藏会话'}
+                </Text>
+                <Text style={styles.settingsCardStatus}>仅这台手机</Text>
+              </View>
+              <Text style={styles.settingsCardBody}>
+                点击会话卡上的“隐藏”即可收起。它不会停止 Agent 或关闭通知；需要你处理或运行失败时，仍会进入注意力队列。
+              </Text>
+              {hiddenSessions.map((session) => (
+                <SpringPressable
+                  accessibilityLabel={`恢复 ${session.project_alias}`}
+                  accessibilityRole="button"
+                  key={session.session_ref}
+                  onPress={() =>
+                    void restoreHiddenSession(session.session_ref)
+                  }
+                  pressedScale={0.99}
+                  style={styles.hiddenSessionRow}
+                >
+                  <View>
+                    <Text style={styles.hiddenSessionName}>
+                      {session.project_alias}
+                    </Text>
+                    <Text style={styles.hiddenSessionCode}>
+                      …{session.session_ref.slice(-4).toUpperCase()}
+                    </Text>
+                  </View>
+                  <Text style={styles.hiddenSessionRestore}>恢复</Text>
+                </SpringPressable>
+              ))}
+              {hiddenSessionRefs.length ? (
+                <SpringPressable
+                  accessibilityRole="button"
+                  onPress={() => void restoreHiddenSessions()}
+                  style={styles.compactButton}
+                >
+                  <Text style={styles.compactButtonText}>恢复全部会话</Text>
+                </SpringPressable>
+              ) : null}
+            </View>
 
             <Text style={styles.settingsSectionLabel}>后台通知</Text>
             <View style={styles.settingsCard}>
@@ -1705,7 +2281,7 @@ export default function App() {
               {!previewMode &&
               savedDevice &&
               webPushStatus.canEnable ? (
-                <Pressable
+                <SpringPressable
                   accessibilityRole="button"
                   disabled={webPushBusy}
                   onPress={() => void activateWebPush()}
@@ -1717,7 +2293,71 @@ export default function App() {
                   <Text style={styles.compactButtonText}>
                     {webPushBusy ? '正在启用…' : '启用后台通知'}
                   </Text>
-                </Pressable>
+                </SpringPressable>
+              ) : null}
+              {!previewMode &&
+              savedDevice &&
+              webPushStatus.phase === 'subscribed' ? (
+                <View style={styles.notificationTestPanel}>
+                  <Text style={styles.notificationTestTitle}>
+                    {notificationTestConfirmed
+                      ? '通知链路已验证'
+                      : notificationTestSent
+                        ? '测试通知已发出'
+                        : '最后做一次真实测试'}
+                  </Text>
+                  <Text style={styles.notificationTestBody}>
+                    {notificationTestConfirmed
+                      ? '这台手机已经确认收到过 Codexy 的系统通知。'
+                      : notificationTestSent
+                        ? '锁屏或切到其他 App 检查系统横幅；看到后回这里确认。'
+                        : '发送固定的安全内容，不包含 Prompt、代码或本机路径。'}
+                  </Text>
+                  {notificationTestSent && !notificationTestConfirmed ? (
+                    <SpringPressable
+                      accessibilityRole="button"
+                      onPress={() => void confirmNotificationTest()}
+                      style={styles.compactButton}
+                    >
+                      <Text style={styles.compactButtonText}>
+                        我已看到测试通知
+                      </Text>
+                    </SpringPressable>
+                  ) : null}
+                  <SpringPressable
+                    accessibilityRole="button"
+                    disabled={notificationTestBusy}
+                    onPress={() => void testNotification()}
+                    style={[
+                      notificationTestSent && !notificationTestConfirmed
+                        ? styles.secondaryCompactButton
+                        : styles.compactButton,
+                      notificationTestBusy && styles.buttonDisabled,
+                    ]}
+                  >
+                    {notificationTestBusy ? (
+                      <ActivityIndicator
+                        color={
+                          notificationTestSent && !notificationTestConfirmed
+                            ? '#111111'
+                            : '#FFFFFF'
+                        }
+                      />
+                    ) : (
+                      <Text
+                        style={
+                          notificationTestSent && !notificationTestConfirmed
+                            ? styles.secondaryCompactButtonText
+                            : styles.compactButtonText
+                        }
+                      >
+                        {notificationTestSent || notificationTestConfirmed
+                          ? '再次发送测试通知'
+                          : '发送测试通知'}
+                      </Text>
+                    )}
+                  </SpringPressable>
+                </View>
               ) : null}
             </View>
 
@@ -1831,7 +2471,7 @@ export default function App() {
               <Text style={styles.step}>03 · 用快速模板或项目简报继续 Prompt</Text>
             </View>
             <Text selectable style={styles.diagnosticCommand}>
-              遇到问题：npm.cmd run diagnose
+              遇到问题：codexy doctor
             </Text>
 
             <Text style={styles.settingsSectionLabel}>数据边界</Text>
@@ -1878,6 +2518,95 @@ export default function App() {
         )}
       </ScrollView>
 
+      <Modal
+        animationType="fade"
+        onRequestClose={() => setPendingHiddenSession(null)}
+        transparent
+        visible={Boolean(pendingHiddenSession)}
+      >
+        <View style={styles.actionOverlay}>
+          <Pressable
+            accessibilityLabel="取消隐藏会话"
+            accessibilityRole="button"
+            onPress={() => setPendingHiddenSession(null)}
+            style={StyleSheet.absoluteFill}
+          />
+          <View style={styles.actionSheet}>
+            <View style={styles.actionSheetHandle} />
+            <Text style={styles.actionSheetEyebrow}>整理工作台</Text>
+            <Text style={styles.actionSheetTitle}>
+              隐藏 {pendingHiddenSession?.project_alias}？
+            </Text>
+            <Text style={styles.actionSheetBody}>
+              只会从这台手机的会话轨道中隐藏，不会删除会话、停止 Agent
+              或关闭通知。需要你处理或运行失败时，它仍会回到注意力队列。
+            </Text>
+            <SpringPressable
+              accessibilityRole="button"
+              onPress={() => void confirmHideSession()}
+              style={styles.actionSheetPrimary}
+            >
+              <Text style={styles.actionSheetPrimaryText}>隐藏这条会话</Text>
+            </SpringPressable>
+            <SpringPressable
+              accessibilityRole="button"
+              onPress={() => setPendingHiddenSession(null)}
+              style={styles.actionSheetCancel}
+            >
+              <Text style={styles.actionSheetCancelText}>取消</Text>
+            </SpringPressable>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        animationType="fade"
+        onRequestClose={() => setResetConfirmationVisible(false)}
+        transparent
+        visible={resetConfirmationVisible}
+      >
+        <View style={styles.actionOverlay}>
+          <Pressable
+            accessibilityLabel="取消撤销设备"
+            accessibilityRole="button"
+            onPress={() => setResetConfirmationVisible(false)}
+            style={StyleSheet.absoluteFill}
+          />
+          <View style={styles.actionSheet}>
+            <View style={styles.actionSheetHandle} />
+            <Text style={styles.actionSheetEyebrow}>连接管理</Text>
+            <Text style={styles.actionSheetTitle}>撤销这台手机？</Text>
+            <Text style={styles.actionSheetBody}>
+              电脑端设备凭据、后台推送订阅和本机草稿都会删除。之后需要重新连接并配对。
+            </Text>
+            <SpringPressable
+              accessibilityRole="button"
+              disabled={connecting}
+              onPress={() => {
+                setResetConfirmationVisible(false);
+                void resetConnection();
+              }}
+              style={[
+                styles.actionSheetPrimary,
+                styles.actionSheetDanger,
+                connecting && styles.buttonDisabled,
+              ]}
+            >
+              <Text style={styles.actionSheetPrimaryText}>
+                {connecting ? '正在撤销…' : '撤销并断开'}
+              </Text>
+            </SpringPressable>
+            <SpringPressable
+              accessibilityRole="button"
+              onPress={() => setResetConfirmationVisible(false)}
+              style={styles.actionSheetCancel}
+            >
+              <Text style={styles.actionSheetCancelText}>取消</Text>
+            </SpringPressable>
+          </View>
+        </View>
+      </Modal>
+
       <BottomNavigation active={activeTab} onChange={setActiveTab} />
     </SafeAreaView>
   );
@@ -1896,9 +2625,9 @@ const styles = StyleSheet.create({
   setupContent: {
     alignSelf: 'center',
     maxWidth: 620,
-    paddingBottom: 64,
+    paddingBottom: 44,
     paddingHorizontal: 24,
-    paddingTop: 44,
+    paddingTop: 32,
     width: '100%',
   },
   wordmark: { alignItems: 'center', flexDirection: 'row', gap: 10 },
@@ -1915,64 +2644,58 @@ const styles = StyleSheet.create({
   },
   setupTitle: {
     color: '#111111',
-    fontSize: 38,
+    fontSize: 36,
     fontWeight: '800',
     letterSpacing: -1.3,
-    lineHeight: 47,
-    marginTop: 56,
+    lineHeight: 44,
+    marginTop: 38,
   },
   setupDescription: {
     color: '#575650',
     fontSize: 15,
-    lineHeight: 25,
-    marginTop: 16,
-  },
-  featureList: {
-    borderBottomColor: '#D7D5CE',
-    borderTopColor: '#D7D5CE',
-    borderTopWidth: 1,
-    marginTop: 32,
-  },
-  featureItem: {
-    borderBottomColor: '#D7D5CE',
-    borderBottomWidth: 1,
-    color: '#3F3E39',
-    fontSize: 12,
-    paddingVertical: 13,
+    lineHeight: 23,
+    marginTop: 12,
   },
   setupPromiseCard: {
     backgroundColor: '#E9E7E0',
     borderColor: '#D0CDC4',
     borderWidth: 1,
-    marginTop: 28,
-    padding: 16,
+    marginTop: 24,
+    padding: 18,
   },
   setupPromiseEyebrow: {
-    color: '#77736A',
-    fontSize: 8,
+    color: '#66635B',
+    fontSize: 11,
     fontWeight: '800',
-    letterSpacing: 1.2,
+    letterSpacing: 0.8,
   },
   setupPromiseTitle: {
     color: '#20201D',
-    fontSize: 16,
+    fontSize: 17,
     fontWeight: '800',
-    marginTop: 8,
+    marginTop: 7,
   },
   setupPromiseUrl: {
     color: '#55524B',
     fontSize: 10,
     marginTop: 8,
   },
+  setupInstallSteps: {
+    color: '#282722',
+    fontSize: 11,
+    fontWeight: '700',
+    lineHeight: 22,
+    marginTop: 12,
+  },
   setupPromiseBody: {
-    color: '#6A675F',
-    fontSize: 10,
-    lineHeight: 17,
-    marginTop: 8,
+    color: '#57544D',
+    fontSize: 12,
+    lineHeight: 19,
+    marginTop: 10,
   },
   fieldLabel: {
-    color: '#77746C',
-    fontSize: 9,
+    color: '#66635B',
+    fontSize: 11,
     fontWeight: '700',
     letterSpacing: 1.4,
     marginTop: 34,
@@ -1990,14 +2713,16 @@ const styles = StyleSheet.create({
   primaryButton: {
     alignItems: 'center',
     backgroundColor: '#111111',
-    marginTop: 14,
-    minHeight: 49,
+    marginTop: 16,
+    minHeight: 52,
     justifyContent: 'center',
   },
-  primaryButtonText: { color: '#FFFFFF', fontSize: 13, fontWeight: '700' },
+  primaryButtonText: { color: '#FFFFFF', fontSize: 14, fontWeight: '800' },
   buttonDisabled: { opacity: 0.42 },
   advancedButton: {
     alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 44,
     paddingVertical: 11,
   },
   advancedButtonText: {
@@ -2011,15 +2736,17 @@ const styles = StyleSheet.create({
     borderColor: '#C9C7C0',
     borderWidth: 1,
     marginTop: 10,
+    minHeight: 48,
     paddingVertical: 12,
   },
   previewButtonText: { color: '#33322E', fontSize: 12, fontWeight: '700' },
-  previewButtonMeta: { color: '#89867E', fontSize: 9, marginTop: 4 },
+  previewButtonMeta: { color: '#69665E', fontSize: 10, marginTop: 4 },
   setupPrivacy: {
-    color: '#8B8880',
-    fontSize: 9,
-    lineHeight: 16,
-    marginTop: 22,
+    color: '#69665E',
+    fontSize: 11,
+    lineHeight: 17,
+    marginTop: 18,
+    textAlign: 'center',
   },
   content: {
     alignSelf: 'center',
@@ -2042,13 +2769,6 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     letterSpacing: -0.6,
   },
-  tagline: {
-    color: '#838078',
-    fontSize: 7,
-    fontWeight: '700',
-    letterSpacing: 1.45,
-    marginTop: 3,
-  },
   connectionPill: {
     alignItems: 'center',
     borderColor: '#D2D0C8',
@@ -2065,13 +2785,14 @@ const styles = StyleSheet.create({
     width: 6,
   },
   connectionDotError: { backgroundColor: '#B84035' },
+  connectionDotUnknown: { backgroundColor: '#B17A2B' },
   connectionPillText: { color: '#58564F', fontSize: 9, fontWeight: '700' },
   screenEyebrow: {
     color: '#7B7870',
     fontSize: 9,
     fontWeight: '700',
-    letterSpacing: 1.6,
-    marginTop: 48,
+    letterSpacing: 1.2,
+    marginTop: 38,
   },
   screenTitle: {
     color: '#111111',
@@ -2079,7 +2800,7 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     letterSpacing: -0.9,
     lineHeight: 38,
-    marginTop: 9,
+    marginTop: 8,
   },
   screenLead: {
     color: '#5F5D56',
@@ -2088,22 +2809,13 @@ const styles = StyleSheet.create({
     marginTop: 10,
     maxWidth: 520,
   },
-  metrics: { flexDirection: 'row', gap: 8, marginTop: 25 },
-  metric: {
-    backgroundColor: '#ECEAE4',
-    flex: 1,
-    minHeight: 76,
-    padding: 12,
+  workbenchSummary: {
+    color: '#646159',
+    fontSize: 13,
+    fontWeight: '600',
+    lineHeight: 20,
+    marginTop: 9,
   },
-  metricUrgent: { backgroundColor: '#111111' },
-  metricValue: {
-    color: '#171717',
-    fontSize: 22,
-    fontWeight: '800',
-    fontVariant: ['tabular-nums'],
-  },
-  metricLabel: { color: '#77746C', fontSize: 9, marginTop: 7 },
-  metricTextUrgent: { color: '#FFFFFF' },
   pairingCard: {
     backgroundColor: '#111111',
     marginTop: 18,
@@ -2135,6 +2847,16 @@ const styles = StyleSheet.create({
     lineHeight: 17,
     marginTop: 12,
   },
+  pairingCommand: {
+    backgroundColor: '#292929',
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
+    lineHeight: 20,
+    marginTop: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
   pairingHint: {
     borderTopColor: '#383838',
     borderTopWidth: 1,
@@ -2143,6 +2865,19 @@ const styles = StyleSheet.create({
     lineHeight: 15,
     marginTop: 13,
     paddingTop: 11,
+  },
+  pairingRenewButton: {
+    alignItems: 'center',
+    backgroundColor: '#FFFFFF',
+    justifyContent: 'center',
+    marginTop: 13,
+    minHeight: 44,
+    paddingHorizontal: 14,
+  },
+  pairingRenewButtonText: {
+    color: '#111111',
+    fontSize: 10,
+    fontWeight: '800',
   },
   connectionNote: {
     backgroundColor: '#E7E5DE',
@@ -2157,6 +2892,49 @@ const styles = StyleSheet.create({
     fontSize: 11,
     lineHeight: 18,
     marginTop: 12,
+  },
+  syncUnknownCard: {
+    backgroundColor: '#F1E9DC',
+    borderColor: '#D9C6A8',
+    borderWidth: 1,
+    marginTop: 20,
+    padding: 18,
+  },
+  syncUnknownEyebrow: {
+    color: '#8A642D',
+    fontSize: 8,
+    fontWeight: '800',
+    letterSpacing: 1.3,
+  },
+  syncUnknownTitle: {
+    color: '#2D251A',
+    fontSize: 17,
+    fontWeight: '800',
+    marginTop: 8,
+  },
+  syncUnknownBody: {
+    color: '#6D5C45',
+    fontSize: 11,
+    lineHeight: 18,
+    marginTop: 7,
+  },
+  syncErrorDetail: {
+    color: '#8C3C32',
+    fontSize: 9,
+    lineHeight: 15,
+    marginTop: 9,
+  },
+  syncRetryButton: {
+    alignItems: 'center',
+    backgroundColor: '#111111',
+    marginTop: 15,
+    minHeight: 44,
+    paddingVertical: 12,
+  },
+  syncRetryButtonText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '800',
   },
   urgentCard: {
     backgroundColor: '#111111',
@@ -2247,14 +3025,14 @@ const styles = StyleSheet.create({
     alignItems: 'baseline',
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginTop: 34,
+    marginTop: 28,
   },
   sectionLabel: {
     color: '#2A2925',
-    fontSize: 12,
+    fontSize: 14,
     fontWeight: '800',
   },
-  sectionMeta: { color: '#8A877F', fontSize: 9 },
+  sectionMeta: { color: '#77746C', fontSize: 11 },
   filterRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -2262,8 +3040,11 @@ const styles = StyleSheet.create({
     marginTop: 12,
   },
   filterButton: {
+    alignItems: 'center',
     borderColor: '#C9C6BD',
     borderWidth: 1,
+    justifyContent: 'center',
+    minHeight: 44,
     paddingHorizontal: 10,
     paddingVertical: 7,
   },
@@ -2288,7 +3069,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     borderColor: '#BDBAB1',
     borderWidth: 1,
+    justifyContent: 'center',
     marginTop: 12,
+    minHeight: 44,
     paddingVertical: 13,
   },
   outlineButtonText: { color: '#363530', fontSize: 11, fontWeight: '700' },
@@ -2315,6 +3098,79 @@ const styles = StyleSheet.create({
     fontSize: 11,
     lineHeight: 19,
     marginTop: 8,
+  },
+  actionOverlay: {
+    backgroundColor: 'rgba(16, 16, 16, 0.34)',
+    flex: 1,
+    justifyContent: 'flex-end',
+    padding: 12,
+  },
+  actionSheet: {
+    alignSelf: 'center',
+    backgroundColor: '#FBFAF6',
+    borderColor: '#E1DED5',
+    borderRadius: 26,
+    borderWidth: 1,
+    maxWidth: 560,
+    paddingBottom: 12,
+    paddingHorizontal: 18,
+    paddingTop: 10,
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: -10 },
+    shadowOpacity: 0.12,
+    shadowRadius: 30,
+    width: '100%',
+  },
+  actionSheetHandle: {
+    alignSelf: 'center',
+    backgroundColor: '#D3D0C7',
+    borderRadius: 3,
+    height: 5,
+    width: 42,
+  },
+  actionSheetEyebrow: {
+    color: '#8A867E',
+    fontSize: 8,
+    fontWeight: '800',
+    letterSpacing: 1.3,
+    marginTop: 22,
+  },
+  actionSheetTitle: {
+    color: '#191815',
+    fontSize: 22,
+    fontWeight: '800',
+    letterSpacing: -0.45,
+    marginTop: 7,
+  },
+  actionSheetBody: {
+    color: '#68655E',
+    fontSize: 11,
+    lineHeight: 19,
+    marginTop: 9,
+  },
+  actionSheetPrimary: {
+    alignItems: 'center',
+    backgroundColor: '#111111',
+    borderRadius: 14,
+    marginTop: 20,
+    paddingVertical: 14,
+  },
+  actionSheetDanger: { backgroundColor: '#8E2F29' },
+  actionSheetPrimaryText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  actionSheetCancel: {
+    alignItems: 'center',
+    borderRadius: 14,
+    marginTop: 6,
+    paddingVertical: 13,
+  },
+  actionSheetCancelText: {
+    color: '#5F5C55',
+    fontSize: 11,
+    fontWeight: '700',
   },
   settingsSectionLabel: {
     color: '#77746C',
@@ -2399,10 +3255,53 @@ const styles = StyleSheet.create({
     lineHeight: 17,
     marginTop: 8,
   },
+  hiddenSessionRow: {
+    alignItems: 'center',
+    borderTopColor: '#D5D2C9',
+    borderTopWidth: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 12,
+    minHeight: 48,
+    paddingTop: 10,
+  },
+  hiddenSessionName: {
+    color: '#2C2B27',
+    fontSize: 10,
+    fontWeight: '800',
+  },
+  hiddenSessionCode: {
+    color: '#949087',
+    fontSize: 8,
+    letterSpacing: 0.7,
+    marginTop: 4,
+  },
+  hiddenSessionRestore: {
+    color: '#347148',
+    fontSize: 9,
+    fontWeight: '800',
+  },
   notificationPreviewCard: {
     backgroundColor: '#111111',
     borderRadius: 16,
     padding: 16,
+  },
+  notificationTestPanel: {
+    borderTopColor: '#D5D2C9',
+    borderTopWidth: 1,
+    marginTop: 14,
+    paddingTop: 13,
+  },
+  notificationTestTitle: {
+    color: '#2C2B27',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  notificationTestBody: {
+    color: '#77736A',
+    fontSize: 9,
+    lineHeight: 15,
+    marginTop: 5,
   },
   notificationPreviewApp: {
     color: '#929292',
@@ -2486,10 +3385,28 @@ const styles = StyleSheet.create({
   compactButton: {
     alignItems: 'center',
     backgroundColor: '#111111',
+    justifyContent: 'center',
     marginTop: 13,
+    minHeight: 44,
+    paddingHorizontal: 12,
     paddingVertical: 11,
   },
   compactButtonText: { color: '#FFFFFF', fontSize: 10, fontWeight: '700' },
+  secondaryCompactButton: {
+    alignItems: 'center',
+    borderColor: '#A9A69D',
+    borderWidth: 1,
+    justifyContent: 'center',
+    marginTop: 9,
+    minHeight: 44,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  secondaryCompactButtonText: {
+    color: '#32312D',
+    fontSize: 10,
+    fontWeight: '700',
+  },
   stepsCard: {
     borderColor: '#CDCCC4',
     borderWidth: 1,
@@ -2529,7 +3446,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     borderColor: '#B8B5AC',
     borderWidth: 1,
+    justifyContent: 'center',
     marginTop: 26,
+    minHeight: 44,
     paddingVertical: 13,
   },
   resetButtonText: { color: '#4D4B44', fontSize: 11, fontWeight: '700' },
@@ -2549,6 +3468,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     flex: 1,
     gap: 3,
+    justifyContent: 'center',
+    minHeight: 48,
     paddingVertical: 5,
   },
   bottomTabDot: { color: '#9B9890', fontSize: 8 },

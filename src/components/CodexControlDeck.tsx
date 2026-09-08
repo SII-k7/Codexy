@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AccessibilityInfo,
   ActivityIndicator,
   Animated,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -136,6 +138,7 @@ export function CodexControlDeck(props: {
     useState<CodexControlAction | null>(null);
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
+  const [reduceMotion, setReduceMotion] = useState(false);
   const pulse = useRef(new Animated.Value(0)).current;
 
   const adoptSnapshot = (next: CodexControlSnapshot) => {
@@ -191,23 +194,43 @@ export function CodexControlDeck(props: {
   }, [props.controlStatus, props.online, props.sessionRef]);
 
   useEffect(() => {
+    let active = true;
+    void AccessibilityInfo.isReduceMotionEnabled().then((enabled) => {
+      if (active) setReduceMotion(enabled);
+    });
+    const subscription = AccessibilityInfo.addEventListener(
+      'reduceMotionChanged',
+      setReduceMotion,
+    );
+    return () => {
+      active = false;
+      subscription.remove();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (reduceMotion) {
+      pulse.stopAnimation();
+      pulse.setValue(1);
+      return;
+    }
     const loop = Animated.loop(
       Animated.sequence([
         Animated.timing(pulse, {
           duration: 1200,
           toValue: 1,
-          useNativeDriver: true,
+          useNativeDriver: Platform.OS !== 'web',
         }),
         Animated.timing(pulse, {
           duration: 1200,
           toValue: 0,
-          useNativeDriver: true,
+          useNativeDriver: Platform.OS !== 'web',
         }),
       ]),
     );
     loop.start();
     return () => loop.stop();
-  }, [pulse]);
+  }, [pulse, reduceMotion]);
 
   const activeModel = useMemo(
     () =>
@@ -896,13 +919,17 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
   },
   collapseButton: {
+    alignItems: 'center',
     borderBottomColor: '#4E5347',
     borderBottomWidth: 1,
-    paddingBottom: 2,
+    justifyContent: 'center',
+    minHeight: 44,
+    minWidth: 44,
+    paddingHorizontal: 8,
   },
   collapseButtonText: {
-    color: '#91968A',
-    fontSize: 8,
+    color: '#B1B6AA',
+    fontSize: 10,
     fontWeight: '700',
   },
   unavailableText: {
@@ -944,8 +971,8 @@ const styles = StyleSheet.create({
     width: 1,
   },
   telemetryLabel: {
-    color: '#73796C',
-    fontSize: 7,
+    color: '#9BA094',
+    fontSize: 9,
     fontWeight: '800',
     letterSpacing: 1.2,
   },
@@ -1024,9 +1051,9 @@ const styles = StyleSheet.create({
   },
   modelNameSelected: { color: '#F7F9F2' },
   modelDescription: {
-    color: '#777C71',
-    fontSize: 8,
-    lineHeight: 12,
+    color: '#9FA499',
+    fontSize: 10,
+    lineHeight: 15,
     marginTop: 7,
   },
   modelSignal: {
@@ -1053,17 +1080,18 @@ const styles = StyleSheet.create({
   effortStop: {
     alignItems: 'center',
     flex: 1,
-    minWidth: 38,
+    minHeight: 58,
+    minWidth: 44,
   },
   effortNode: {
     alignItems: 'center',
     backgroundColor: '#262A22',
     borderColor: '#42473C',
-    borderRadius: 17,
+    borderRadius: 22,
     borderWidth: 1,
-    height: 34,
+    height: 44,
     justifyContent: 'center',
-    width: 34,
+    width: 44,
   },
   effortNodeSelected: {
     backgroundColor: '#B8F34A',
@@ -1076,8 +1104,8 @@ const styles = StyleSheet.create({
   },
   effortNodeTextSelected: { color: '#11130F' },
   effortLabel: {
-    color: '#777D70',
-    fontSize: 7,
+    color: '#A1A69B',
+    fontSize: 9,
     fontWeight: '700',
     marginTop: 7,
     maxWidth: 48,
@@ -1092,8 +1120,8 @@ const styles = StyleSheet.create({
     paddingTop: 11,
   },
   effortReadoutLabel: {
-    color: '#6D7267',
-    fontSize: 7,
+    color: '#9DA397',
+    fontSize: 9,
     fontWeight: '800',
     letterSpacing: 1.2,
   },

@@ -131,6 +131,17 @@ test('treats a known thread as ready for lazy resume', () => {
   assert.equal(bridge.statusForSession(sessionRef), 'observe_only');
 });
 
+test('runtime evidence expires and excludes unloaded threads or a disconnected bridge', () => {
+  const bridge = new CodexControlBridge({ enabled: true, spawnServer: false });
+  bridge.state = 'ready'; bridge.indexUpdatedAt = Date.now();
+  const thread = controlledThread({ status: { type: 'active', activeFlags: ['waitingOnApproval'] } });
+  const ref = sessionRefForThreadId(thread.id); bridge.threadIndex.set(ref, thread);
+  assert.equal(bridge.activityForSession(ref).needsInput, true);
+  bridge.indexUpdatedAt = Date.now() - 76000; assert.equal(bridge.activityForSession(ref), null);
+  bridge.indexUpdatedAt = Date.now(); thread.status = { type: 'notLoaded' }; assert.equal(bridge.activityForSession(ref), null);
+  thread.status = { type: 'active' }; bridge.state = 'error'; assert.equal(bridge.activityForSession(ref), null);
+});
+
 test('resumes an unloaded thread before starting a queued mobile prompt', async () => {
   const bridge = new CodexControlBridge({
     enabled: true,
@@ -377,4 +388,31 @@ test('does not start a turn when resume cannot claim direct input', async () => 
     }),
     (error) => error?.code === 'session_observe_only',
   );
+});
+
+test('paginated thread history falls back to bounded recent turns in chronological order', async () => {
+  const bridge = new CodexControlBridge({ enabled: true, spawnServer: false });
+  const calls = [];
+  const newestFirst = [{ id: 'active', status: 'inProgress', items: [] }, { id: 'previous', status: 'completed', items: [] }];
+  bridge.rpc = { async request(method, params) {
+    calls.push({ method, params });
+    if (method === 'thread/read' && params.includeTurns) throw new Error('paginated threads do not support thread/read(includeTurns=true)');
+    if (method === 'thread/read') return { thread: { id: 'fixture', status: { type: 'active' } } };
+    if (method === 'thread/turns/list') return { data: newestFirst, nextCursor: 'older' };
+    throw new Error('Unexpected method');
+  } };
+  const thread = await bridge.readThread('fixture', true);
+  assert.deepEqual(thread.turns.map(t => t.id), ['previous', 'active']);
+  assert.equal(thread.status.type, 'active');
+  assert.equal(newestFirst[0].id, 'active');
+  assert.deepEqual(calls[2], { method: 'thread/turns/list', params: { threadId: 'fixture', limit: 10, sortDirection: 'desc', itemsView: 'full' } });
+  assert.equal(calls.length, 3);
+});
+
+test('thread read failures unrelated to pagination are preserved without extra history reads', async () => {
+  const bridge = new CodexControlBridge({ enabled: true, spawnServer: false });
+  let calls = 0;
+  bridge.rpc = { async request() { calls++; throw new Error('connection unavailable'); } };
+  await assert.rejects(bridge.readThread('fixture', true), /connection unavailable/);
+  assert.equal(calls, 1);
 });

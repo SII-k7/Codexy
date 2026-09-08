@@ -10,6 +10,9 @@ import webpush from 'web-push';
 
 const root = resolve(import.meta.dirname, '..');
 const envPath = resolve(root, '.env.local');
+const codexHome = process.env.CODEX_HOME
+  ? resolve(process.env.CODEX_HOME)
+  : join(homedir(), '.codex');
 let content = existsSync(envPath) ? readFileSync(envPath, 'utf8') : '';
 
 function currentValue(key) {
@@ -63,7 +66,7 @@ setValue('CODEXY_RELAY_PORT', '8797');
 setValue('CODEXY_NODE_COMMAND', JSON.stringify(process.execPath));
 setValue(
   'CODEXY_RELAY_STATE_FILE',
-  join(homedir(), '.codex', 'codexy', 'relay-state.json').replaceAll(
+  join(codexHome, 'codexy', 'relay-state.json').replaceAll(
     '\\',
     '/',
   ),

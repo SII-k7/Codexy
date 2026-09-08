@@ -1,11 +1,15 @@
+import { normalizeGoalInput, publicRuntime, publicMobileGoal } from './session-tools.mjs';
 import { randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
+import { readFileSync } from 'node:fs';
+import { createHubAgent } from '../hub/agent.mjs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { tryServeStatic } from './static-web.mjs';
 import { loadRelayStore, persistRelayStore } from './store.mjs';
+import { createChangeFeed } from './change-feed.mjs';
 import { createWebPushSender, normalizeVapidConfig } from './web-push.mjs';
 import {
   DEFAULT_DEVICE_PREFERENCES,
@@ -21,11 +25,12 @@ import {
   createRemoteCommandManager,
 } from './remote-commands.mjs';
 import { sanitizeAgentReply } from './response-summary.mjs';
+import { projectSessionActivity } from './session-projection.mjs';
 
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_EVENTS_PER_DEVICE = 100;
 const MAX_WEB_PUSH_SUBSCRIPTIONS = 8;
-const MAX_AGENT_SESSIONS = 16;
+const MAX_AGENT_SESSIONS = 128;
 const MAX_PROMPTS_PER_SESSION = 10;
 const PROMPT_RETENTION_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_PAIRING_TTL_MS = 10 * 60 * 1000;
@@ -35,6 +40,24 @@ const CONTROL_REQUEST_RETENTION_MS = 10 * 60 * 1000;
 const DEFAULT_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const DEFAULT_REGISTRATION_LIMIT = 20;
 const DEFAULT_PAIRING_CLAIM_LIMIT = 10;
+const DEFAULT_PAIRING_CODE_RENEWAL_LIMIT = 5;
+const DEFAULT_TEST_NOTIFICATION_LIMIT = 5;
+const PUBLIC_PUSH_STATUSES = new Set([
+  'sent',
+  'not_configured',
+  'not_subscribed',
+  'expired',
+  'failed',
+]);
+const TEST_NOTIFICATION_EVENT = Object.freeze({
+  schema_version: '1.0',
+  event_id: 'codexy-test-notification',
+  source: 'codex',
+  state: 'notification_test',
+  event: 'TestNotification',
+  project_alias: 'Codexy',
+  summary: 'Test notification received. Codexy notifications are ready.',
+});
 const CONTROL_ACTIONS = new Set([
   'status',
   'compact',
@@ -191,6 +214,38 @@ function createAttemptLimiter(options = {}) {
   };
 }
 
+function publicPushStatus(result) {
+  return PUBLIC_PUSH_STATUSES.has(result?.status)
+    ? result.status
+    : 'failed';
+}
+
+function summarizePushDelivery(expoResult, webResult) {
+  const pushChannels = {
+    expo: publicPushStatus(expoResult),
+    web: publicPushStatus(webResult),
+  };
+  const statuses = Object.values(pushChannels);
+  const delivered = statuses.includes('sent');
+  let deliveryStatus = 'not_configured';
+  if (delivered) {
+    deliveryStatus = statuses.some((status) =>
+      ['failed', 'expired'].includes(status),
+    )
+      ? 'partial'
+      : 'sent';
+  } else if (statuses.includes('failed')) {
+    deliveryStatus = 'failed';
+  } else if (statuses.includes('expired')) {
+    deliveryStatus = 'expired';
+  }
+  return {
+    delivered,
+    delivery_status: deliveryStatus,
+    push_channels: pushChannels,
+  };
+}
+
 async function readJson(request) {
   const chunks = [];
   let size = 0;
@@ -210,6 +265,13 @@ async function readJson(request) {
     return parsed;
   } catch {
     throw new HttpError(400, 'request body must be one JSON object');
+  }
+}
+
+async function requireEmptyJson(request, errorCode, message) {
+  const body = await readJson(request);
+  if (Object.keys(body).length) {
+    throw new HttpError(400, message, errorCode);
   }
 }
 
@@ -473,7 +535,8 @@ function pruneAgentSessions(device) {
     session.prompts = retained.slice(-MAX_PROMPTS_PER_SESSION);
   }
   const next = previous
-    .filter((session) => timestamp(session.updated_at) >= cutoff)
+    .filter((session) => timestamp(session.updated_at) >= cutoff ||
+      ['working', 'needs_you', 'failed', 'interrupted'].includes(session.state))
     .sort((left, right) => timestamp(left.updated_at) - timestamp(right.updated_at))
     .slice(-MAX_AGENT_SESSIONS);
   device.agentSessions = next;
@@ -637,7 +700,8 @@ function normalizeControlAction(body) {
 
 function publicControlRateWindow(value) {
   if (!value || typeof value !== 'object') return null;
-  const usedPercent = Number(value.used_percent);
+  const usedPercent = value.used_percent;
+  if (typeof usedPercent !== 'number' || !Number.isFinite(usedPercent)) return null;
   const windowMinutes = Number(value.window_minutes);
   const resetsAt = text(value.resets_at, '', 64);
   return {
@@ -844,10 +908,26 @@ function publicAgentSessions(device, codexControl) {
   return [...(device.agentSessions ?? [])]
     .sort((left, right) => timestamp(right.updated_at) - timestamp(left.updated_at))
     .map((session) => ({
-      ...session,
+      ...projectSessionActivity(session, codexControl.activityForSession?.(session.session_ref)),
       prompt_count: session.prompts.length,
       control_status: sessionControlStatus(session, codexControl),
     }));
+}
+
+function publicDeviceStatus(device, codexControl) {
+  return {
+    device_id: device.deviceId,
+    paired: Boolean(device.hookToken),
+    pairing_code: device.pairingCode,
+    pairing_expires_at: device.pairingExpiresAt
+      ? new Date(device.pairingExpiresAt).toISOString() : null,
+    push_configured: Boolean(device.expoPushToken || device.webPushSubscriptions?.length),
+    web_push_configured: Boolean(device.webPushSubscriptions?.length),
+    preferences: normalizeDevicePreferences(device.preferences),
+    remote_control: codexControl.getStatus?.() ?? {
+      state: 'disabled', detail: '桌面端尚未启用远程控制。', endpoint: null,
+    },
+  };
 }
 
 function normalizeWebPushSubscription(body) {
@@ -880,7 +960,8 @@ export function createRelayServer(options = {}) {
   const webPushSender =
     options.webPushSender ?? createWebPushSender(vapid);
   const store = loadRelayStore(stateFile);
-  const persist = () => persistRelayStore(stateFile, store);
+  const changes = createChangeFeed(options.changeFeedOptions);
+  const persist = () => { persistRelayStore(stateFile, store); changes.notify(); };
   const allowedOrigins = configuredOrigins(
     options.allowedOrigins ?? process.env.CODEXY_ALLOWED_ORIGINS,
   );
@@ -901,14 +982,59 @@ export function createRelayServer(options = {}) {
       rateLimitOptions.windowMs ?? DEFAULT_RATE_LIMIT_WINDOW_MS,
     now: rateLimitOptions.now,
   });
+  const pairingCodeRenewalLimiter = createAttemptLimiter({
+    limit:
+      rateLimitOptions.pairingCodeRenewalLimit ??
+      DEFAULT_PAIRING_CODE_RENEWAL_LIMIT,
+    windowMs:
+      rateLimitOptions.windowMs ?? DEFAULT_RATE_LIMIT_WINDOW_MS,
+    now: rateLimitOptions.now,
+  });
+  const testNotificationLimiter = createAttemptLimiter({
+    limit:
+      rateLimitOptions.testNotificationLimit ??
+      DEFAULT_TEST_NOTIFICATION_LIMIT,
+    windowMs:
+      rateLimitOptions.windowMs ?? DEFAULT_RATE_LIMIT_WINDOW_MS,
+    now: rateLimitOptions.now,
+  });
   const codexControl =
     options.codexControl ?? createCodexControlFromEnvironment();
+  const unsubscribeControl = codexControl.subscribe?.(() => changes.notify());
   const remoteCommands = createRemoteCommandManager({
     dispatch: (command, setStatus) =>
       codexControl.dispatch(command, setStatus),
     ...(options.remoteCommandOptions ?? {}),
+    onChange: () => changes.notify(),
   });
   const controlRequests = new Map();
+
+  async function deliverDevicePush(device, event, preferences) {
+    if (event.session_ref) event = { ...event, device_ref: device.deviceId };
+    const [expoPushResult, webPushResult] = await Promise.all([
+      pushSender(device.expoPushToken, event, preferences),
+      webPushSender(
+        device.webPushSubscriptions ?? [],
+        event,
+        preferences,
+      ),
+    ]);
+    let deviceChanged = false;
+    if (webPushResult.expiredEndpoints?.length) {
+      const expired = new Set(webPushResult.expiredEndpoints);
+      const current = device.webPushSubscriptions ?? [];
+      device.webPushSubscriptions = current.filter(
+        (subscription) => !expired.has(subscription.endpoint),
+      );
+      deviceChanged ||= device.webPushSubscriptions.length !== current.length;
+    }
+    if (expoPushResult.status === 'expired' && device.expoPushToken) {
+      device.expoPushToken = null;
+      deviceChanged = true;
+    }
+    if (deviceChanged) persist();
+    return { expoPushResult, webPushResult };
+  }
 
   function pruneControlRequests() {
     const cutoff = Date.now() - CONTROL_REQUEST_RETENTION_MS;
@@ -1122,6 +1248,26 @@ export function createRelayServer(options = {}) {
         const deviceId = validateDeviceId(segments[2]);
         const device = requireDevice(store, deviceId, request);
 
+        if (request.method === 'GET' && segments[3] === 'changes' && segments.length === 4) {
+          changes.watch(request, response, url.searchParams.get('after'),
+            () => { try { return requireDevice(store, deviceId, request) === device; } catch { return false; } }, sendJson);
+          return;
+        }
+
+        if (request.method === 'GET' && segments[3] === 'snapshot' && segments.length === 4) {
+          if (pruneAgentSessions(device)) persist();
+          // One synchronous projection: no transcript reads or App Server RPCs.
+          sendJson(response, 200, {
+            status: publicDeviceStatus(device, codexControl),
+            sessions: publicAgentSessions(device, codexControl),
+            commands: remoteCommands.list(device.deviceId),
+            events: device.events,
+            next_cursor: device.nextCursor,
+            generated_at: new Date().toISOString(),
+          });
+          return;
+        }
+
         if (request.method === 'DELETE' && segments.length === 3) {
           if (device.hookToken) {
             store.hookTokens.delete(device.hookToken);
@@ -1182,6 +1328,75 @@ export function createRelayServer(options = {}) {
 
         if (
           request.method === 'POST' &&
+          segments[3] === 'pairing-code' &&
+          segments.length === 4
+        ) {
+          await requireEmptyJson(
+            request,
+            'pairing_code_content_not_allowed',
+            'pairing code renewal does not accept content',
+          );
+          if (device.hookToken) {
+            throw new HttpError(
+              409,
+              'paired devices cannot renew a pairing code',
+              'device_already_paired',
+            );
+          }
+          if (!pairingCodeRenewalLimiter.take(device.deviceId)) {
+            throw new HttpError(
+              429,
+              'too many pairing code renewal attempts',
+              'pairing_code_rate_limited',
+            );
+          }
+          device.pairingCode = createPairingCode(store);
+          device.pairingExpiresAt = Date.now() + pairingTtlMs;
+          persist();
+          sendJson(response, 200, {
+            device_id: device.deviceId,
+            pairing_code: device.pairingCode,
+            pairing_expires_at: new Date(
+              device.pairingExpiresAt,
+            ).toISOString(),
+            paired: false,
+          });
+          return;
+        }
+
+        if (
+          request.method === 'POST' &&
+          segments[3] === 'test-notification' &&
+          segments.length === 4
+        ) {
+          await requireEmptyJson(
+            request,
+            'test_notification_content_not_allowed',
+            'test notifications do not accept content',
+          );
+          if (!testNotificationLimiter.take(device.deviceId)) {
+            throw new HttpError(
+              429,
+              'too many test notification attempts',
+              'test_notification_rate_limited',
+            );
+          }
+          const preferences = normalizeDevicePreferences(device.preferences);
+          const { expoPushResult, webPushResult } = await deliverDevicePush(
+            device,
+            TEST_NOTIFICATION_EVENT,
+            preferences,
+          );
+          sendJson(response, 200, {
+            ...summarizePushDelivery(expoPushResult, webPushResult),
+            content_source: 'fixed',
+            persisted: false,
+          });
+          return;
+        }
+
+        if (
+          request.method === 'POST' &&
           segments[3] === 'web-push-subscriptions' &&
           segments.length === 4
         ) {
@@ -1236,7 +1451,7 @@ export function createRelayServer(options = {}) {
             const session = (device.agentSessions ?? []).find(
               (candidate) => candidate.session_ref === event.session_ref,
             );
-            if (session) {
+            if (session && session.last_event_at === event.occurred_at) {
               session.acknowledged_at = event.acknowledged_at;
             }
           }
@@ -1277,6 +1492,24 @@ export function createRelayServer(options = {}) {
             persisted: false,
           });
           return;
+        }
+
+        if (segments[3] === 'sessions' && segments[4] && segments.length === 6 && ['runtime', 'goal'].includes(segments[5])) {
+          const sessionRef = validateSessionRef(segments[4]);
+          requireControlSession(device, sessionRef, codexControl);
+          if (request.method === 'GET' && segments[5] === 'runtime') {
+            sendJson(response, 200, { runtime: publicRuntime(await codexControl.getSessionRuntime(sessionRef), sessionRef) }); return;
+          }
+          if (request.method === 'PATCH' && segments[5] === 'goal') {
+            const body = await readJson(request);
+            const key = normalizeControlIdempotencyKey(body.idempotency_key);
+            let input;
+            try { input = normalizeGoalInput(body); } catch (error) { throw new HttpError(400, error.message, 'invalid_goal'); }
+            const result = await runIdempotentControlRequest(device.deviceId, 'goal:' + sessionRef + ':' + key,
+              () => codexControl.updateSessionGoal(sessionRef, input));
+            sendJson(response, 200, { goal: publicMobileGoal(result.goal) }); return;
+          }
+          throw new HttpError(405, 'method not allowed');
         }
 
         if (
@@ -1394,6 +1627,11 @@ export function createRelayServer(options = {}) {
           segments.length === 4
         ) {
           const input = normalizeRemotePrompt(await readJson(request));
+          const replay = remoteCommands.findExisting({ ...input, deviceId: device.deviceId });
+          if (replay) {
+            sendJson(response, 202, { command: replay, exact_prompt_persisted: false });
+            return;
+          }
           const session = (device.agentSessions ?? []).find(
             (candidate) => candidate.session_ref === input.sessionRef,
           );
@@ -1460,6 +1698,7 @@ export function createRelayServer(options = {}) {
         const device = requirePairedDevice(store, request);
         const capture = normalizePromptCapture(await readJson(request));
         updateSessionFromPrompt(device, capture);
+        codexControl.scheduleRefresh?.();
         persist();
         sendJson(response, 202, {
           accepted: true,
@@ -1496,6 +1735,7 @@ export function createRelayServer(options = {}) {
           for (const item of removed) device.dedupeKeys.delete(item.dedupe_key);
         }
         updateSessionFromEvent(device, storedEvent);
+        codexControl.scheduleRefresh?.();
 
         persist();
         const preferences = normalizeDevicePreferences(device.preferences);
@@ -1503,30 +1743,16 @@ export function createRelayServer(options = {}) {
           storedEvent.state,
           preferences.notification_level,
         );
-        const [expoPushResult, webPushResult] = shouldPush
-          ? await Promise.all([
-              pushSender(device.expoPushToken, storedEvent, preferences),
-              webPushSender(
-                device.webPushSubscriptions ?? [],
-                storedEvent,
-                preferences,
-              ),
-            ])
-          : [
-              { status: 'filtered' },
-              { status: 'filtered', sent: 0, expiredEndpoints: [] },
-            ];
-        if (webPushResult.expiredEndpoints?.length) {
-          const expired = new Set(webPushResult.expiredEndpoints);
-          device.webPushSubscriptions = (
-            device.webPushSubscriptions ?? []
-          ).filter((subscription) => !expired.has(subscription.endpoint));
-          persist();
-        }
-        if (expoPushResult.status === 'expired') {
-          device.expoPushToken = null;
-          persist();
-        }
+        const { expoPushResult, webPushResult } = shouldPush
+          ? await deliverDevicePush(device, storedEvent, preferences)
+          : {
+              expoPushResult: { status: 'filtered' },
+              webPushResult: {
+                status: 'filtered',
+                sent: 0,
+                expiredEndpoints: [],
+              },
+            };
         sendJson(response, 202, {
           accepted: true,
           deduplicated: false,
@@ -1573,6 +1799,8 @@ export function createRelayServer(options = {}) {
   });
 
   server.on('close', () => {
+    unsubscribeControl?.();
+    changes.close();
     remoteCommands.close();
     codexControl.stop?.();
   });
@@ -1614,7 +1842,7 @@ async function main() {
   const { host, port, stateFile, webRoot } = parseServerArgs(
     process.argv.slice(2),
   );
-  const { server } = createRelayServer({
+  const { server, store } = createRelayServer({
     stateFile,
     webRoot,
     vapid: {
@@ -1630,6 +1858,19 @@ async function main() {
     },
   });
   server.listen(port, host, () => {
+    if (process.env.CODEXY_HUB_AGENT_CONFIG) {
+      try {
+        const config = JSON.parse(readFileSync(process.env.CODEXY_HUB_AGENT_CONFIG, 'utf8'));
+        const agent = createHubAgent({ ...config, localUrl: `http://127.0.0.1:${port}`,
+          resolveIdentity: () => {
+            const device = store.devices.get(store.activeDeviceId);
+            return device?.hookToken ? { deviceId: device.deviceId, deviceSecret: device.deviceSecret } : null;
+          },
+        });
+        server.on('close', () => agent.close());
+        console.log('Codexy Hub connector enabled');
+      } catch { console.error('Codexy Hub connector configuration is invalid; local Relay remains available.'); }
+    }
     console.log(`Codexy Relay listening on http://${host}:${port}`);
     console.log(`Relay state: ${stateFile}`);
     if (webRoot) console.log(`Private PWA root: ${webRoot}`);

@@ -3,17 +3,22 @@
 This is the reviewed, Codex-only hook bundle for Codexy. Install these
 runtime files under:
 
-`%USERPROFILE%\.codex\codexy-hooks`
+- Windows: `%USERPROFILE%\.codex\codexy-hooks`
+- Ubuntu/macOS: `${CODEX_HOME:-$HOME/.codex}/codexy-hooks`
 
 - `capture_prompt.cmd`
 - `capture_prompt.mjs`
+- `capture_prompt.sh`
 - `hook_common.mjs`
 - `notify_mobile.cmd`
 - `notify_mobile.mjs`
+- `notify_mobile.sh`
 - `hooks.json` (the hook definitions to review and merge into Codex)
 
-The hook commands in `hooks.json` use `%USERPROFILE%`; they do not contain a
-developer machine path or a path back to this repository.
+The hook commands in `hooks.json` use the current user profile or home
+directory; they do not contain a developer machine path or a path back to
+this repository. Unix setup records the absolute Node.js executable in the
+managed runtime so hooks also work when systemd or launchd has a minimal PATH.
 
 ## What leaves the PC
 
@@ -32,8 +37,8 @@ hooks use Codexy's required Node.js runtime; Python is not required.
 Codexy defaults to:
 
 - Relay endpoints on `http://127.0.0.1:8797`;
-- state at `%USERPROFILE%\.codex\codexy\relay-state.json`;
-- hook logs at `%USERPROFILE%\.codex\codexy\hook.log`.
+- state at `~/.codex/codexy/relay-state.json`;
+- hook logs at `~/.codex/codexy/hook.log`.
 
 `CODEXY_*` variables take priority. Explicit legacy `ATTENTION_*` variables
 remain accepted for migration, but no Codexy default points to the old app.

@@ -141,7 +141,7 @@ try {
   }
   Write-Output ''
   Write-Output 'Codexy update complete.'
-  Write-Output 'Run npm.cmd run diagnose, then refresh Codexy on iPhone.'
+  Write-Output 'Run codexy doctor, then refresh Codexy on iPhone.'
 } catch {
   $updateError = $_
   Write-Warning 'Codexy update failed; restoring the previous PWA configuration.'

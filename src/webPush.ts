@@ -9,7 +9,11 @@ export const DEFAULT_WEB_PUSH_STATUS: WebPushStatus = {
   canEnable: false,
 };
 
-export async function getWebPushStatus(): Promise<WebPushStatus> {
+export function requiresStandaloneInstall(): boolean {
+  return false;
+}
+
+export async function getWebPushStatus(_input?: { relayUrl: string; deviceId: string }): Promise<WebPushStatus> {
   return DEFAULT_WEB_PUSH_STATUS;
 }
 
@@ -29,4 +33,8 @@ export async function syncWebPush(_input: {
   return DEFAULT_WEB_PUSH_STATUS;
 }
 
-export async function disableWebPush(): Promise<void> {}
+export async function disableWebPush(_input?: { relayUrl: string; deviceId: string }): Promise<void> {}
+
+export async function resetExpiredWebPush(_input?: { relayUrl: string; deviceId: string }): Promise<WebPushStatus> {
+  return DEFAULT_WEB_PUSH_STATUS;
+}

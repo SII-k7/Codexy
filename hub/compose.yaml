@@ -1,0 +1,30 @@
+name: codexy-hub
+services:
+  hub:
+    build:
+      context: ./release
+      dockerfile: hub/Dockerfile
+      args:
+        NODE_IMAGE: ${CODEXY_NODE_IMAGE:-node:22-alpine}
+    image: codexy-hub:local
+    container_name: codexy-hub
+    restart: unless-stopped
+    user: "${CODEXY_HUB_UID:-1000}:${CODEXY_HUB_GID:-1000}"
+    ports:
+      - "127.0.0.1:8797:8797"
+    volumes:
+      - ./data:/data:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "2m"
+        max-file: "2"

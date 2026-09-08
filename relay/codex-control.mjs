@@ -5,12 +5,13 @@ import { dirname, resolve } from 'node:path';
 import WebSocket from 'ws';
 
 import { RemoteCommandError } from './remote-commands.mjs';
+import { contextUsage, publicGoal, weeklyLimit, finiteNumber } from './session-tools.mjs';
 import { summarizeLatestAgentReply } from './response-summary.mjs';
 
 const DEFAULT_APP_SERVER_URL = 'ws://127.0.0.1:4510';
 const RPC_TIMEOUT_MS = 15_000;
-const INDEX_REFRESH_MS = 2_500;
-const QUEUE_POLL_MS = 1_000;
+const INDEX_REFRESH_MS = 60_000;
+const QUEUE_POLL_MS = 30_000;
 const MODEL_CATALOG_TTL_MS = 60_000;
 
 function publicString(value, fallback = '', maxLength = 160) {
@@ -32,7 +33,8 @@ function publicIdentifier(value, fallback = '') {
 
 function publicRateLimitWindow(value) {
   if (!value || typeof value !== 'object') return null;
-  const usedPercent = Number(value.usedPercent);
+  const usedPercent = finiteNumber(value.usedPercent);
+  if (usedPercent === null) return null;
   return {
     used_percent: Number.isFinite(usedPercent)
       ? Math.max(0, Math.min(100, usedPercent))
@@ -74,6 +76,9 @@ function wait(milliseconds) {
 }
 
 function requireActiveCommand(command) {
+  if (command.status === 'expired' || Date.now() >= command.expiresAtMs) {
+    throw new RemoteCommandError('command_expired', '指令在发送前已过期。');
+  }
   if (command.status === 'canceled' || !command.prompt) {
     throw new RemoteCommandError(
       'command_canceled',
@@ -128,13 +133,15 @@ export function sessionRefForThreadId(threadId) {
   return `sha256:${digest.slice(0, 24)}`;
 }
 
-class AppServerRpc {
-  constructor(url) {
+export class AppServerRpc {
+  constructor(url, onNotification = () => {}, onDisconnect = () => {}) {
     this.url = url;
     this.socket = null;
     this.nextId = 1;
     this.pending = new Map();
     this.closed = false;
+    this.onNotification = onNotification;
+    this.onDisconnect = onDisconnect;
   }
 
   async connect() {
@@ -188,6 +195,12 @@ class AppServerRpc {
     } catch {
       return;
     }
+    // Server requests have their own ID namespace; never mistake an approval
+    // request for the reply to one of our RPCs. The TUI handles approvals.
+    if (typeof message.method === 'string') {
+      if (!Object.hasOwn(message, 'id')) this.onNotification(message.method, message.params);
+      return;
+    }
     if (!Object.hasOwn(message, 'id')) return;
     const pending = this.pending.get(String(message.id));
     if (!pending) {
@@ -215,9 +228,10 @@ class AppServerRpc {
     this.closed = true;
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
-      pending.reject(new Error('app-server websocket closed'));
+      pending.reject(pending.deliveryError ?? new Error('app-server websocket closed'));
     }
     this.pending.clear();
+    this.onDisconnect();
   }
 
   request(method, params) {
@@ -230,11 +244,14 @@ class AppServerRpc {
     }
     const id = String(this.nextId++);
     return new Promise((resolve, reject) => {
+      const deliveryError = ['turn/start', 'turn/steer'].includes(method)
+        ? new RemoteCommandError('delivery_unknown', '电脑连接中断，无法确认 Codex 是否已接收。请查看会话后再决定，勿直接重复发送。')
+        : null;
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`${method} timed out`));
+        reject(deliveryError ?? new Error(`${method} timed out`));
       }, RPC_TIMEOUT_MS);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve, reject, timer, deliveryError });
       this.socket.send(JSON.stringify({ id, method, params }));
     });
   }
@@ -260,7 +277,7 @@ class AppServerRpc {
     this.socket?.terminate();
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
-      pending.reject(new Error('app-server client closed'));
+      pending.reject(pending.deliveryError ?? new Error('app-server client closed'));
     }
     this.pending.clear();
   }
@@ -287,11 +304,92 @@ export class CodexControlBridge {
     this.rpc = null;
     this.child = null;
     this.threadIndex = new Map();
+    this.indexUpdatedAt = 0;
     this.modelCatalog = [];
     this.modelCatalogLoadedAt = 0;
+    this.contextBySession = new Map();
+    this.rateCache = null;
+    this.rateLoadedAt = 0;
+    this.ratePromise = null;
     this.refreshTimer = null;
     this.startPromise = null;
     this.stopped = false;
+    this.listeners = new Set();
+    this.threadVersions = new Map();
+    this.subscribed = new Set();
+    this.refreshPromise = null;
+    this.eventTimer = null;
+    this.retryTimer = null;
+  }
+
+  subscribe(listener) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  changed(sessionRef = null) {
+    for (const listener of this.listeners) listener(sessionRef);
+  }
+
+  scheduleRefresh() {
+    if (this.stopped || this.eventTimer) return;
+    this.eventTimer = setTimeout(() => {
+      this.eventTimer = null;
+      void this.refreshIndex(true).catch(() => this.recover());
+    }, 100);
+    this.eventTimer.unref?.();
+  }
+
+  handleNotification(method, params = {}) {
+    if (method === 'account/rateLimits/updated') { this.rateLoadedAt = 0; this.changed(); return; }
+    const id = params.threadId ?? params.thread?.id;
+    if (typeof id !== 'string') return;
+    const ref = sessionRefForThreadId(id);
+    if (method === 'thread/tokenUsage/updated') {
+      const usage = contextUsage(params.tokenUsage);
+      if (usage) this.contextBySession.set(ref, usage); else this.contextBySession.delete(ref);
+      this.changed(ref); return;
+    }
+    if (['thread/goal/updated', 'thread/goal/cleared', 'thread/settings/updated'].includes(method)) {
+      if (method === 'thread/settings/updated') this.contextBySession.delete(ref);
+      this.changed(ref); return;
+    }
+    let status;
+    if (method === 'thread/status/changed') status = params.status;
+    else if (method === 'thread/started') status = params.thread?.status;
+    else if (method === 'thread/closed') status = { type: 'notLoaded' };
+    else if (method === 'turn/started') status = { type: 'active', activeFlags: [] };
+    else if (method === 'turn/completed') {
+      // Read the authoritative status: completion can race another queued turn.
+      this.scheduleRefresh();
+      this.changed(ref);
+      return;
+    } else if (['thread/archived', 'thread/deleted'].includes(method)) {
+      this.threadVersions.set(ref, (this.threadVersions.get(ref) ?? 0) + 1);
+      this.threadIndex.delete(ref); this.subscribed.delete(ref); this.contextBySession.delete(ref);
+      this.changed(ref); return;
+    } else return; // Never retain item content, tool output or prompt text.
+    if (!['active', 'idle', 'notLoaded', 'systemError'].includes(status?.type)) return;
+    this.threadVersions.set(ref, (this.threadVersions.get(ref) ?? 0) + 1);
+    const known = this.threadIndex.get(ref);
+    this.threadIndex.set(ref, {
+      id, ...known, status: { type: status.type, activeFlags: status.activeFlags ?? [] },
+      updatedAt: Date.now() / 1000, observedAtMs: Date.now(),
+    });
+    if (status.type === 'notLoaded') this.subscribed.delete(ref);
+    if (!known) this.scheduleRefresh();
+    this.changed(ref);
+  }
+
+  waitForThreadChange(threadId, timeoutMs) {
+    const ref = sessionRefForThreadId(threadId);
+    return new Promise((resolve) => {
+      const finish = () => { clearTimeout(timer); unsubscribe(); resolve(); };
+      const unsubscribe = this.subscribe((changedRef) => {
+        if (changedRef === null || changedRef === ref) finish();
+      });
+      const timer = setTimeout(finish, Math.max(1, timeoutMs));
+    });
   }
 
   getStatus() {
@@ -316,9 +414,27 @@ export class CodexControlBridge {
     return 'ready';
   }
 
+  activityForSession(sessionRef) {
+    if (this.state !== 'ready') return null;
+    const thread = this.threadIndex.get(sessionRef);
+    const observedAt = thread?.observedAtMs ?? this.indexUpdatedAt;
+    if (Date.now() - observedAt > INDEX_REFRESH_MS + RPC_TIMEOUT_MS) return null;
+    const status = thread?.status;
+    if (!['active', 'idle', 'systemError'].includes(status?.type)) return null;
+    return {
+      type: status.type,
+      needsInput: status.activeFlags?.some((flag) => ['waitingOnApproval', 'waitingOnUserInput'].includes(flag)) ?? false,
+      observedAt: new Date(observedAt).toISOString(),
+      updatedAt: typeof thread.updatedAt === 'number' && Number.isFinite(thread.updatedAt)
+        ? new Date(thread.updatedAt * 1000).toISOString() : null,
+    };
+  }
+
   async connectRpc() {
-    const rpc = new AppServerRpc(this.url);
-    await rpc.connect();
+    const rpc = new AppServerRpc(this.url,
+      (method, params) => { if (this.rpc === rpc) this.handleNotification(method, params); },
+      () => { if (this.rpc === rpc) this.recover(); });
+    try { await rpc.connect(); } catch (error) { rpc.close(); throw error; }
     return rpc;
   }
 
@@ -357,6 +473,7 @@ export class CodexControlBridge {
       this.startChild();
       let lastError = firstError;
       for (let attempt = 0; attempt < 40; attempt += 1) {
+        if (this.stopped) throw new Error('app-server bridge stopped');
         await wait(250);
         try {
           return await this.connectRpc();
@@ -377,12 +494,17 @@ export class CodexControlBridge {
       try {
         this.rpc?.close();
         this.rpc = await this.connectWithRetry();
+        if (this.stopped) { this.rpc.close(); this.rpc = null; return; }
+        this.subscribed.clear();
+        this.contextBySession.clear();
+        this.rateLoadedAt = 0;
         this.state = 'ready';
         this.detail = '手机可向由 codexy 打开的 Codex 会话发送指令。';
-        await this.refreshIndex();
+        await this.refreshIndex(true);
         if (!this.refreshTimer) {
           this.refreshTimer = setInterval(
-            () => void this.refreshIndex().catch(() => this.recover()),
+            () => this.state === 'ready'
+              ? void this.refreshIndex(true).catch(() => this.recover()) : this.recover(),
             INDEX_REFRESH_MS,
           );
           this.refreshTimer.unref?.();
@@ -390,6 +512,11 @@ export class CodexControlBridge {
       } catch (error) {
         this.state = 'error';
         this.detail = safeControlDetail(error);
+        this.changed();
+        if (!this.stopped && !this.retryTimer) {
+          this.retryTimer = setTimeout(() => { this.retryTimer = null; this.recover(); }, 5000);
+          this.retryTimer.unref?.();
+        }
         throw error;
       } finally {
         this.startPromise = null;
@@ -402,17 +529,26 @@ export class CodexControlBridge {
     if (this.stopped || !this.enabled || this.state === 'starting') return;
     this.state = 'starting';
     this.detail = '正在重新连接本机 Codex App Server。';
+    this.changed();
     void this.start().catch(() => {
       // Status is exposed to the phone; the next refresh will retry.
     });
   }
 
-  async refreshIndex() {
+  async refreshIndex(subscribeLoaded = false) {
     if (!this.rpc || this.state !== 'ready') return;
+    if (this.refreshPromise) return this.refreshPromise;
+    this.refreshPromise = this.reconcileIndex(subscribeLoaded);
+    try { await this.refreshPromise; } finally { this.refreshPromise = null; }
+  }
+
+  async reconcileIndex(subscribeLoaded) {
+    const rpc = this.rpc;
+    const versions = new Map(this.threadVersions);
     const nextIndex = new Map();
     let cursor = null;
     do {
-      const result = await this.rpc.request('thread/list', {
+      const result = await rpc.request('thread/list', {
         cursor,
         limit: 100,
         sortKey: 'updated_at',
@@ -422,11 +558,32 @@ export class CodexControlBridge {
       });
       for (const thread of result?.data ?? []) {
         if (typeof thread?.id !== 'string') continue;
-        nextIndex.set(sessionRefForThreadId(thread.id), thread);
+        nextIndex.set(sessionRefForThreadId(thread.id), { ...thread, observedAtMs: Date.now() });
       }
       cursor = result?.nextCursor ?? null;
     } while (cursor && nextIndex.size < 500);
+    if (this.rpc !== rpc || this.stopped) return;
+    // Notifications received during an older list request win over that list.
+    for (const [ref, version] of this.threadVersions) {
+      if (version !== versions.get(ref)) {
+        if (this.threadIndex.has(ref)) nextIndex.set(ref, this.threadIndex.get(ref));
+        else nextIndex.delete(ref);
+      }
+    }
     this.threadIndex = nextIndex;
+    this.indexUpdatedAt = Date.now();
+    this.changed();
+    if (!subscribeLoaded) return;
+    // Resume only already-loaded threads, without turns or configuration
+    // overrides, to subscribe this connection. Never load historical threads.
+    for (const [ref, thread] of nextIndex) {
+      if (!['idle', 'active'].includes(thread.status?.type) || this.subscribed.has(ref)) continue;
+      try {
+        await rpc.request('thread/resume', { threadId: thread.id, excludeTurns: true });
+        if (this.rpc !== rpc || this.stopped) return;
+        this.subscribed.add(ref);
+      } catch { /* Older servers can still use low-frequency reconciliation. */ }
+    }
   }
 
   async ensureReady() {
@@ -451,7 +608,7 @@ export class CodexControlBridge {
 
   async threadForSession(sessionRef) {
     await this.ensureReady();
-    await this.refreshIndex();
+    if (!this.threadIndex.has(sessionRef) || Date.now() - this.indexUpdatedAt >= INDEX_REFRESH_MS) await this.refreshIndex();
     const thread = this.threadIndex.get(sessionRef);
     if (!thread) {
       throw new RemoteCommandError(
@@ -471,11 +628,20 @@ export class CodexControlBridge {
   }
 
   async readThread(threadId, includeTurns = false) {
-    const result = await this.rpc.request('thread/read', {
-      threadId,
-      includeTurns,
-    });
-    return result.thread;
+    try {
+      const result = await this.rpc.request('thread/read', { threadId, includeTurns });
+      return result.thread;
+    } catch (error) {
+      if (!includeTurns || !/paginated threads do not support thread\/read/i.test(error?.message ?? '')) throw error;
+      // New paginated stores reject inline history. Read only recent turns,
+      // without resuming or modifying the conversation. Keep chronological
+      // order for the summary and active-turn consumers used by older stores.
+      const metadata = await this.rpc.request('thread/read', { threadId, includeTurns: false });
+      const page = await this.rpc.request('thread/turns/list', {
+        threadId, limit: 10, sortDirection: 'desc', itemsView: 'full',
+      });
+      return { ...metadata.thread, turns: [...(page.data ?? [])].reverse() };
+    }
   }
 
   async resumeThread(thread) {
@@ -537,6 +703,14 @@ export class CodexControlBridge {
   }
 
   async readPublicRateLimit() {
+    if (Date.now() - this.rateLoadedAt < 60_000) return this.rateCache;
+    if (this.ratePromise) return this.ratePromise;
+    this.ratePromise = this.fetchPublicRateLimit();
+    try { this.rateCache = await this.ratePromise; this.rateLoadedAt = Date.now(); return this.rateCache; }
+    finally { this.ratePromise = null; }
+  }
+
+  async fetchPublicRateLimit() {
     try {
       const result = await this.rpc.request('account/rateLimits/read');
       const snapshot =
@@ -549,6 +723,35 @@ export class CodexControlBridge {
     } catch {
       return null;
     }
+  }
+
+  async getSessionRuntime(sessionRef) {
+    const thread = await this.threadForSession(sessionRef);
+    const [rate, result] = await Promise.all([
+      this.readPublicRateLimit(),
+      this.rpc.request('thread/goal/get', { threadId: thread.id }).then(value => ({ available: true, goal: publicGoal(value?.goal) })).catch(() => ({ available: false, goal: null })),
+    ]);
+    return { session_ref: sessionRef, context: this.contextBySession.get(sessionRef) ?? null,
+      weekly: weeklyLimit(rate), goal_available: result.available, goal: result.goal,
+      refreshed_at: new Date().toISOString() };
+  }
+
+  async updateSessionGoal(sessionRef, input) {
+    let thread = await this.threadForSession(sessionRef);
+    // Claim only the selected conversation, and only after explicit user action.
+    thread = await this.resumeForDirectInput(thread);
+    const params = { threadId: thread.id, status: input.action === 'pause' ? 'paused' : 'active' };
+    if (input.action === 'set') {
+      params.objective = input.objective;
+      if (input.tokenBudget !== undefined) params.tokenBudget = input.tokenBudget;
+    }
+    if (input.action !== 'set') {
+      const current = await this.rpc.request('thread/goal/get', { threadId: thread.id });
+      if (!current?.goal) throw new RemoteCommandError('goal_missing', '该会话还没有 Goal。', 409);
+    }
+    const result = await this.rpc.request('thread/goal/set', params);
+    this.changed(sessionRef);
+    return { goal: publicGoal(result?.goal) };
   }
 
   async buildControlSnapshot(sessionRef, resumed, models) {
@@ -615,6 +818,9 @@ export class CodexControlBridge {
       input.reasoningEffort,
       current.reasoning_effort ?? model.default_effort,
     );
+    if (input.reasoningEffort && !model.supported_efforts.includes(requestedEffort)) {
+      throw new RemoteCommandError('invalid_reasoning_effort', '所选模型不支持这个思考强度。', 400);
+    }
     const effort = model.supported_efforts.includes(requestedEffort)
       ? requestedEffort
       : model.default_effort;
@@ -638,6 +844,8 @@ export class CodexControlBridge {
       model: model.id,
       effort,
     });
+    this.contextBySession.delete(sessionRef);
+    this.changed(sessionRef);
     return this.getSessionControl(sessionRef);
   }
 
@@ -732,6 +940,9 @@ export class CodexControlBridge {
   async dispatch(command, onStatus) {
     requireActiveCommand(command);
     let thread = await this.threadForSession(command.sessionRef);
+    // Delivery checks this thread's current metadata, even when the overview
+    // cache is fresh. A missed notification must not bypass Queue semantics.
+    if (thread.canAcceptDirectInput === true) thread = await this.readThread(thread.id, false);
     thread = await this.resumeForDirectInput(thread);
     if (!['idle', 'active'].includes(thread.status?.type)) {
       throw new RemoteCommandError(
@@ -750,8 +961,9 @@ export class CodexControlBridge {
           );
         }
         onStatus?.('waiting', '当前回合仍在工作，指令会在结束后发送。');
-        await wait(QUEUE_POLL_MS);
+        await this.waitForThreadChange(thread.id, Math.min(QUEUE_POLL_MS, command.expiresAtMs - Date.now()));
         requireActiveCommand(command);
+        await this.ensureReady();
         thread = await this.readThread(thread.id, false);
       }
       if (thread.status?.type !== 'idle') {
@@ -814,6 +1026,8 @@ export class CodexControlBridge {
 
   stop() {
     this.stopped = true;
+    clearTimeout(this.eventTimer); clearTimeout(this.retryTimer);
+    this.changed(); this.listeners.clear();
     if (this.refreshTimer) clearInterval(this.refreshTimer);
     this.refreshTimer = null;
     this.rpc?.close();

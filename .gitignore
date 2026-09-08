@@ -31,6 +31,7 @@ yarn-debug.*
 yarn-error.*
 expo-*.out.log
 expo-*.err.log
+.codexy-private.*.log
 .tmp-app-server-schema-*/
 __pycache__/
 *.py[cod]
@@ -42,6 +43,11 @@ __pycache__/
 # local env files
 .env*.local
 .npm-cache/
+output/
+.npm-cache-superdesign/
+.playwright-cli/
+.superdesign/
+docs/audits/
 
 # local relay state
 relay/.data/
